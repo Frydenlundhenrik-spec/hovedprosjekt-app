@@ -6,3 +6,5 @@ ifcopenshell
 python-docx
 reportlab
 plotly
+streamlit-plotly-events
+plotly
