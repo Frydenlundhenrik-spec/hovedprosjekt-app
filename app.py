@@ -1733,6 +1733,411 @@ def make_report_summary_dict(filename, filtered_df):
     }
 
 
+
+
+# -------------------------
+# BYGGGENERATOR – PARAMETRISK MODELL FRA EXCEL-LOGIKK
+# -------------------------
+
+QUALITY_LIBRARY = {
+    "Stål": {
+        "S235": {"density": 7850.0, "co2": 0.73, "price": 43.0},
+        "S355": {"density": 7850.0, "co2": 0.73, "price": 47.0},
+        "S460": {"density": 7850.0, "co2": 0.78, "price": 55.0},
+    },
+    "Limtre": {
+        "GL24c": {"density": 430.0, "co2": 95.0, "price": 26000.0},
+        "GL30c": {"density": 460.0, "co2": 100.0, "price": 28000.0},
+        "GL32h": {"density": 480.0, "co2": 105.0, "price": 30500.0},
+    },
+    "Betong": {
+        "B25": {"density": 2350.0, "co2": 310.0, "price": 1650.0},
+        "B35": {"density": 2400.0, "co2": 350.0, "price": 1800.0},
+        "B45": {"density": 2450.0, "co2": 390.0, "price": 2050.0},
+        "Lavkarbon B35": {"density": 2400.0, "co2": 260.0, "price": 2150.0},
+    },
+    "Massivtre": {
+        "C24/CLT": {"density": 500.0, "co2": 110.0, "price": 30000.0},
+    },
+}
+
+
+def quality_options(material: str):
+    return list(QUALITY_LIBRARY.get(material, {"Standard": {}}).keys())
+
+
+def make_material_profile_label(material: str, quality: str, profile: str) -> str:
+    if material == "Betong":
+        return f"{quality}, Betong / {profile}"
+    if material == "Stål":
+        return f"{quality}, Stål / {profile}"
+    if material == "Limtre":
+        return f"{quality}, Limtre / {profile}"
+    if material == "Massivtre":
+        return f"{quality}, Massivtre / {profile}"
+    return f"{quality}, {material} / {profile}"
+
+
+def material_quality_values(material: str, quality: str) -> dict:
+    return QUALITY_LIBRARY.get(material, {}).get(quality, {"density": 1000.0, "co2": 200.0, "price": 1000.0})
+
+
+def generate_frame_export_parametric(params: dict) -> pd.DataFrame:
+    """Genererer søyle-/bjelkesystem fra valg i appen. Støtter rektangel 1 og valgfritt rektangel 2."""
+    geom = generate_plan_geometry(params)
+    dx = geom["dx"]
+    dy = geom["dy"]
+    etasjeh = safe_num(params.get("etasjehoyde_mm", 3000)) / 1000.0
+    if etasjeh <= 0:
+        etasjeh = 3.0
+    n_levels = max(int(round(safe_num(params.get("antall_etasjer", 1)))), 1)
+    rows = []
+    col_id = 1
+    beam_id = 1
+    seen_columns = set()
+    seen_beams = set()
+
+    for level in range(1, n_levels + 1):
+        z0 = (level - 1) * etasjeh
+        z1 = level * etasjeh
+        for rect in geom["rectangles"]:
+            fx = max(int(round(rect["width"] / dx)), 1) if dx > 0 else 1
+            fy = max(int(round(rect["height"] / dy)), 1) if dy > 0 else 1
+            x0 = rect["x"]
+            y0 = rect["y"]
+            for ix in range(fx + 1):
+                for iy in range(fy + 1):
+                    x = round(x0 + ix * dx, 6)
+                    y = round(y0 + iy * dy, 6)
+                    ckey = (level, x, y, round(z0, 6), round(z1, 6))
+                    if ckey not in seen_columns:
+                        rows.append({"Type": "Søyle", "ID": f"C{col_id}", "Nivå": level, "X1 [m]": x, "Y1 [m]": y, "Z1 [m]": z0, "X2 [m]": x, "Y2 [m]": y, "Z2 [m]": z1})
+                        seen_columns.add(ckey)
+                        col_id += 1
+            for iy in range(fy + 1):
+                y = round(y0 + iy * dy, 6)
+                for ix in range(fx):
+                    x1 = round(x0 + ix * dx, 6)
+                    x2 = round(x0 + (ix + 1) * dx, 6)
+                    bkey = (level, min(x1, x2), y, z1, max(x1, x2), y, z1)
+                    if bkey not in seen_beams:
+                        rows.append({"Type": "Bjelke", "ID": f"B{beam_id}", "Nivå": level, "X1 [m]": x1, "Y1 [m]": y, "Z1 [m]": z1, "X2 [m]": x2, "Y2 [m]": y, "Z2 [m]": z1})
+                        seen_beams.add(bkey)
+                        beam_id += 1
+            for ix in range(fx + 1):
+                x = round(x0 + ix * dx, 6)
+                for iy in range(fy):
+                    y1 = round(y0 + iy * dy, 6)
+                    y2 = round(y0 + (iy + 1) * dy, 6)
+                    bkey = (level, x, min(y1, y2), z1, x, max(y1, y2), z1)
+                    if bkey not in seen_beams:
+                        rows.append({"Type": "Bjelke", "ID": f"B{beam_id}", "Nivå": level, "X1 [m]": x, "Y1 [m]": y1, "Z1 [m]": z1, "X2 [m]": x, "Y2 [m]": y2, "Z2 [m]": z1})
+                        seen_beams.add(bkey)
+                        beam_id += 1
+    return pd.DataFrame(rows)
+
+
+def frame_to_quantity_dataset(frame_df: pd.DataFrame, slab_df: pd.DataFrame, params: dict) -> pd.DataFrame:
+    rows = []
+    beam_mat = params.get("bjelkemateriale", "Stål")
+    beam_quality = params.get("bjelkekvalitet", "S355")
+    beam_profile = params.get("bjelkeprofil", "KFHUP 200x200x12.5")
+    col_mat = params.get("søylemateriale", "Stål")
+    col_quality = params.get("søylekvalitet", "S355")
+    col_profile = params.get("søyleprofil", "KFHUP 200x200x12.5")
+
+    for _, r in frame_df.iterrows():
+        typ = str(r["Type"])
+        if typ == "Bjelke":
+            mat, qual, profile = beam_mat, beam_quality, beam_profile
+        else:
+            mat, qual, profile = col_mat, col_quality, col_profile
+        length = math.sqrt((safe_num(r["X2 [m]"]) - safe_num(r["X1 [m]"])) ** 2 + (safe_num(r["Y2 [m]"]) - safe_num(r["Y1 [m]"])) ** 2 + (safe_num(r["Z2 [m]"]) - safe_num(r["Z1 [m]"])) ** 2)
+        area = parse_profile_area_from_text(profile, mat)
+        if pd.isna(area) or area <= 0:
+            area = 0.04 if mat == "Stål" else 0.09
+        volume = length * area
+        qv = material_quality_values(mat, qual)
+        weight = volume * qv["density"]
+        if mat == "Stål":
+            cost = weight * qv["price"]
+            co2 = weight * qv["co2"]
+        else:
+            cost = volume * qv["price"]
+            co2 = volume * qv["co2"]
+        rows.append({
+            "Segment": r["ID"], "Type": typ, "Nivå": r["Nivå"],
+            "Knutepunkter": "", "Material / Tverrsnitt": make_material_profile_label(mat, qual, profile),
+            "Lengde [m]": length, "Areal [m2]": area, "Volum [m3]": volume, "Vekt [kg]": weight,
+            "materiale": mat, "Materialkvalitet": qual, "Mengdegrunnlag": "Bygggenerator", "Endret IFC": False,
+            "Kostnad [kr]": cost, "CO2 [kgCO2e]": co2,
+        })
+
+    deck_mat = params.get("dekke_materialtype", "Betong")
+    deck_quality = params.get("dekke_kvalitet", "B35")
+    deck_profile = f"t={safe_num(params.get('dekke_tykkelse_mm', 300)):.0f} mm"
+    qv = material_quality_values(deck_mat, deck_quality)
+    for _, r in slab_df.iterrows():
+        area = safe_num(r.get("Areal [m²]", r.get("Areal [m2]", 0)))
+        thickness = safe_num(r.get("Tykkelse [mm]", params.get("dekke_tykkelse_mm", 300))) / 1000.0
+        volume = area * thickness
+        weight = volume * qv["density"]
+        cost = volume * qv["price"]
+        co2 = volume * qv["co2"]
+        rows.append({
+            "Segment": r.get("DeckID", "D"), "Type": "Dekke", "Nivå": r.get("Nivå", 1),
+            "Knutepunkter": "", "Material / Tverrsnitt": make_material_profile_label(deck_mat, deck_quality, deck_profile),
+            "Lengde [m]": math.nan, "Areal [m2]": area, "Volum [m3]": volume, "Vekt [kg]": weight,
+            "materiale": deck_mat, "Materialkvalitet": deck_quality, "Mengdegrunnlag": "Bygggenerator", "Endret IFC": False,
+            "Kostnad [kr]": cost, "CO2 [kgCO2e]": co2,
+        })
+    return pd.DataFrame(rows)
+
+
+def plot_frame_3d(frame_df: pd.DataFrame, slab_df: pd.DataFrame | None = None):
+    fig = go.Figure()
+    if frame_df is not None and not frame_df.empty:
+        for typ, group in frame_df.groupby("Type"):
+            xs, ys, zs = [], [], []
+            for _, r in group.iterrows():
+                xs += [r["X1 [m]"], r["X2 [m]"], None]
+                ys += [r["Y1 [m]"], r["Y2 [m]"], None]
+                zs += [r["Z1 [m]"], r["Z2 [m]"], None]
+            fig.add_trace(go.Scatter3d(x=xs, y=ys, z=zs, mode="lines", name=typ, line=dict(width=6 if typ == "Søyle" else 4)))
+    if slab_df is not None and not slab_df.empty:
+        for _, r in slab_df.iterrows():
+            pts = []
+            for i in range(1, 9):
+                val = str(r.get(f"P{i} (X,Y)", "") or "")
+                nums = [float(x.strip())/1000.0 for x in val.split(",") if x.strip().replace("-", "").isdigit()]
+                if len(nums) == 2:
+                    pts.append(nums)
+            if len(pts) >= 3:
+                z = safe_num(r.get("Z [mm]", 0)) / 1000.0
+                fig.add_trace(go.Mesh3d(x=[p[0] for p in pts], y=[p[1] for p in pts], z=[z]*len(pts), opacity=0.18, name=f"Dekke {r.get('Nivå','')}", color="#808080"))
+    fig.update_layout(height=650, margin=dict(l=0, r=0, t=20, b=0), scene=dict(xaxis_title="X [m]", yaxis_title="Y [m]", zaxis_title="Z [m]", aspectmode="data"))
+    return fig
+
+
+# -------------------------
+# IFC-EKSPORT FOR BYGGGENERATOR
+# -------------------------
+
+def _ifc_guid():
+    return ifcopenshell.guid.new()
+
+
+def _ifc_point(model, x=0.0, y=0.0, z=0.0):
+    return model.create_entity("IfcCartesianPoint", Coordinates=(float(x), float(y), float(z)))
+
+
+def _ifc_dir(model, x=0.0, y=0.0, z=1.0):
+    return model.create_entity("IfcDirection", DirectionRatios=(float(x), float(y), float(z)))
+
+
+def _ifc_axis3d(model, location=None, axis=None, ref_direction=None):
+    return model.create_entity(
+        "IfcAxis2Placement3D",
+        Location=location or _ifc_point(model, 0, 0, 0),
+        Axis=axis or _ifc_dir(model, 0, 0, 1),
+        RefDirection=ref_direction or _ifc_dir(model, 1, 0, 0),
+    )
+
+
+def _ifc_local_placement(model, relative_to=None, x=0.0, y=0.0, z=0.0, axis=None, ref_direction=None):
+    return model.create_entity(
+        "IfcLocalPlacement",
+        PlacementRelTo=relative_to,
+        RelativePlacement=_ifc_axis3d(model, _ifc_point(model, x, y, z), axis, ref_direction),
+    )
+
+
+def _ifc_product_shape(model, context, width: float, height: float, depth: float):
+    """Lager enkel rektangulær SweptSolid-geometri. Lokalt ekstruderes profilen i Z-retningen."""
+    profile = model.create_entity(
+        "IfcRectangleProfileDef",
+        ProfileType="AREA",
+        ProfileName="byggTotal rektangelprofil",
+        Position=model.create_entity("IfcAxis2Placement2D", Location=model.create_entity("IfcCartesianPoint", Coordinates=(0.0, 0.0))),
+        XDim=max(float(width), 0.001),
+        YDim=max(float(height), 0.001),
+    )
+    solid = model.create_entity(
+        "IfcExtrudedAreaSolid",
+        SweptArea=profile,
+        Position=_ifc_axis3d(model),
+        ExtrudedDirection=_ifc_dir(model, 0, 0, 1),
+        Depth=max(float(depth), 0.001),
+    )
+    body = model.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=context,
+        RepresentationIdentifier="Body",
+        RepresentationType="SweptSolid",
+        Items=[solid],
+    )
+    return model.create_entity("IfcProductDefinitionShape", Representations=[body])
+
+
+def _get_profile_dims_m(profile_text: str, material_hint: str, fallback=(0.2, 0.2)):
+    nums = [float(x.replace(",", ".")) for x in re.findall(r"\d+[\.,]?\d*", str(profile_text or ""))]
+    if len(nums) >= 2:
+        # For stål HUP/KFHUP med tre tall brukes bredde/høyde som de to første av de tre siste tallene.
+        if classify_material(material_hint if material_hint else profile_text) == "Stål" and len(nums) >= 3:
+            return max(nums[-3] / 1000.0, 0.001), max(nums[-2] / 1000.0, 0.001)
+        return max(nums[-2] / 1000.0, 0.001), max(nums[-1] / 1000.0, 0.001)
+    return fallback
+
+
+def _beam_orientation(model, x1, y1, z1, x2, y2, z2):
+    dx, dy, dz = float(x2 - x1), float(y2 - y1), float(z2 - z1)
+    length = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if length <= 0:
+        return _ifc_dir(model, 0, 0, 1), _ifc_dir(model, 1, 0, 0), 0.001
+    axis = _ifc_dir(model, dx / length, dy / length, dz / length)
+    # RefDirection må ikke være parallell med Axis. Global Z fungerer for horisontale bjelker.
+    if abs(dz / length) > 0.95:
+        ref = _ifc_dir(model, 1, 0, 0)
+    else:
+        ref = _ifc_dir(model, 0, 0, 1)
+    return axis, ref, length
+
+
+def generate_building_ifc_bytes(frame_df: pd.DataFrame, slab_df: pd.DataFrame, params: dict, project_name: str = "byggTotal generert bygg") -> bytes:
+    """Genererer en enkel IFC4-fil fra Bygggeneratoren.
+
+    IFC-en inneholder etasjer, søyler, bjelker og dekker med enkel rektangulær geometri,
+    materialnavn og spatial containment. Den er laget for tidligfasevisning i Solibri/BIM-viewer.
+    """
+    if ifcopenshell is None:
+        raise ImportError("ifcopenshell er ikke installert. Legg til ifcopenshell i requirements.txt for IFC-eksport.")
+
+    model = ifcopenshell.file(schema="IFC4")
+
+    origin = _ifc_axis3d(model)
+    context = model.create_entity(
+        "IfcGeometricRepresentationContext",
+        ContextIdentifier="Model",
+        ContextType="Model",
+        CoordinateSpaceDimension=3,
+        Precision=1e-5,
+        WorldCoordinateSystem=origin,
+    )
+    units = model.create_entity("IfcUnitAssignment", Units=[
+        model.create_entity("IfcSIUnit", UnitType="LENGTHUNIT", Name="METRE"),
+        model.create_entity("IfcSIUnit", UnitType="AREAUNIT", Name="SQUARE_METRE"),
+        model.create_entity("IfcSIUnit", UnitType="VOLUMEUNIT", Name="CUBIC_METRE"),
+    ])
+
+    project = model.create_entity("IfcProject", GlobalId=_ifc_guid(), Name=project_name, RepresentationContexts=[context], UnitsInContext=units)
+    site_placement = _ifc_local_placement(model)
+    site = model.create_entity("IfcSite", GlobalId=_ifc_guid(), Name="Tomt", ObjectPlacement=site_placement)
+    building_placement = _ifc_local_placement(model, site_placement)
+    building = model.create_entity("IfcBuilding", GlobalId=_ifc_guid(), Name="Generert råbygg", ObjectPlacement=building_placement)
+    model.create_entity("IfcRelAggregates", GlobalId=_ifc_guid(), RelatingObject=project, RelatedObjects=[site])
+    model.create_entity("IfcRelAggregates", GlobalId=_ifc_guid(), RelatingObject=site, RelatedObjects=[building])
+
+    n_levels = max(int(round(safe_num(params.get("antall_etasjer", 1)))), 1)
+    etasjeh = safe_num(params.get("etasjehoyde_mm", 3000)) / 1000.0
+    if etasjeh <= 0:
+        etasjeh = 3.0
+
+    storeys = {}
+    storey_children = {i: [] for i in range(1, n_levels + 1)}
+    storey_list = []
+    for level in range(1, n_levels + 1):
+        z = (level - 1) * etasjeh
+        sp = _ifc_local_placement(model, building_placement, 0, 0, z)
+        storey = model.create_entity("IfcBuildingStorey", GlobalId=_ifc_guid(), Name=f"Etasje {level}", ObjectPlacement=sp, Elevation=z)
+        storeys[level] = storey
+        storey_list.append(storey)
+    model.create_entity("IfcRelAggregates", GlobalId=_ifc_guid(), RelatingObject=building, RelatedObjects=storey_list)
+
+    material_entities = {}
+    def get_material(name):
+        name = str(name or "Ukjent")
+        if name not in material_entities:
+            material_entities[name] = model.create_entity("IfcMaterial", Name=name)
+        return material_entities[name]
+
+    def assign_material(product, mat_name):
+        model.create_entity("IfcRelAssociatesMaterial", GlobalId=_ifc_guid(), RelatedObjects=[product], RelatingMaterial=get_material(mat_name))
+
+    beam_mat = params.get("bjelkemateriale", "Stål")
+    beam_quality = params.get("bjelkekvalitet", "S355")
+    beam_profile = params.get("bjelkeprofil", "KFHUP 200x200x12.5")
+    col_mat = params.get("søylemateriale", "Stål")
+    col_quality = params.get("søylekvalitet", "S355")
+    col_profile = params.get("søyleprofil", "KFHUP 200x200x12.5")
+    deck_mat = params.get("dekke_materialtype", "Betong")
+    deck_quality = params.get("dekke_kvalitet", "B35")
+    deck_thk = safe_num(params.get("dekke_tykkelse_mm", 300)) / 1000.0
+    if deck_thk <= 0:
+        deck_thk = 0.3
+
+    if frame_df is not None and not frame_df.empty:
+        for _, r in frame_df.iterrows():
+            typ = str(r.get("Type", ""))
+            level = max(int(round(safe_num(r.get("Nivå", 1)))), 1)
+            x1, y1, z1 = safe_num(r.get("X1 [m]")), safe_num(r.get("Y1 [m]")), safe_num(r.get("Z1 [m]"))
+            x2, y2, z2 = safe_num(r.get("X2 [m]")), safe_num(r.get("Y2 [m]")), safe_num(r.get("Z2 [m]"))
+            axis, ref, length = _beam_orientation(model, x1, y1, z1, x2, y2, z2)
+            if typ == "Søyle":
+                w, h = _get_profile_dims_m(col_profile, col_mat, fallback=(0.3, 0.3))
+                mat_label = f"{col_mat} {col_quality}"
+                shape = _ifc_product_shape(model, context, w, h, length)
+                placement = _ifc_local_placement(model, None, x1, y1, z1, axis, ref)
+                product = model.create_entity("IfcColumn", GlobalId=_ifc_guid(), Name=str(r.get("ID", "Søyle")), ObjectPlacement=placement, Representation=shape)
+            else:
+                w, h = _get_profile_dims_m(beam_profile, beam_mat, fallback=(0.2, 0.3))
+                mat_label = f"{beam_mat} {beam_quality}"
+                shape = _ifc_product_shape(model, context, w, h, length)
+                placement = _ifc_local_placement(model, None, x1, y1, z1, axis, ref)
+                product = model.create_entity("IfcBeam", GlobalId=_ifc_guid(), Name=str(r.get("ID", "Bjelke")), ObjectPlacement=placement, Representation=shape)
+            assign_material(product, mat_label)
+            if level in storey_children:
+                storey_children[level].append(product)
+
+    if slab_df is not None and not slab_df.empty:
+        for _, r in slab_df.iterrows():
+            level = max(int(round(safe_num(r.get("Nivå", 1)))), 1)
+            pts = []
+            for i in range(1, 9):
+                raw = str(r.get(f"P{i} (X,Y)", "") or "")
+                nums = [float(x.strip()) / 1000.0 for x in raw.split(",") if x.strip().replace("-", "").replace(".", "").isdigit()]
+                if len(nums) == 2:
+                    pts.append(tuple(nums))
+            if len(pts) >= 3:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                xmin, xmax = min(xs), max(xs)
+                ymin, ymax = min(ys), max(ys)
+                width = max(xmax - xmin, 0.001)
+                depth = max(ymax - ymin, 0.001)
+                z_top = safe_num(r.get("Z [mm]", level * etasjeh * 1000)) / 1000.0
+                shape = _ifc_product_shape(model, context, width, depth, deck_thk)
+                placement = _ifc_local_placement(model, None, xmin + width / 2.0, ymin + depth / 2.0, z_top - deck_thk, _ifc_dir(model, 0, 0, 1), _ifc_dir(model, 1, 0, 0))
+                slab = model.create_entity("IfcSlab", GlobalId=_ifc_guid(), Name=str(r.get("DeckID", f"Dekke {level}")), ObjectPlacement=placement, Representation=shape, PredefinedType="FLOOR")
+                assign_material(slab, f"{deck_mat} {deck_quality}")
+                if level in storey_children:
+                    storey_children[level].append(slab)
+
+    for level, children in storey_children.items():
+        if children:
+            model.create_entity("IfcRelContainedInSpatialStructure", GlobalId=_ifc_guid(), RelatedElements=children, RelatingStructure=storeys[level])
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp:
+        temp_path = tmp.name
+    try:
+        model.write(temp_path)
+        with open(temp_path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
 st.markdown("""
 <div class="custom-card">
     <div style="font-size:42px; font-weight:800; color:#1f2937;">byggTotal</div>
@@ -1748,7 +2153,7 @@ st.markdown("""
 st.sidebar.title("byggTotal")
 valg = st.sidebar.radio(
     "Velg side",
-    ["Mengder", "Grunn", "Materialbytte", "BREEAM", "CO₂-regnskap", "3D-modell", "Prosjektering", "Rapport"],
+    ["Mengder", "Grunn", "Materialbytte", "BREEAM", "CO₂-regnskap", "3D-modell", "Prosjektering", "Bygggenerator", "Rapport"],
 )
 
 with st.sidebar:
@@ -1839,8 +2244,14 @@ try:
         except Exception:
             excel_supports_prosjektering = False
     else:
-        st.info("Last opp en Excel-fil eller IFC-fil i sidepanelet for å starte analysen.")
-        st.stop()
+        if valg == "Bygggenerator":
+            filename = "Generert bygg"
+            data = pd.DataFrame(columns=["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "materiale", "Materialkvalitet", "Endret IFC", "Mengdegrunnlag", "Kostnad [kr]", "CO2 [kgCO2e]"])
+            nodes = pd.DataFrame()
+            forside = pd.DataFrame()
+        else:
+            st.info("Last opp en Excel-fil eller IFC-fil i sidepanelet for å starte analysen, eller velg Bygggenerator for å starte uten fil.")
+            st.stop()
 except Exception as e:
     st.error(f"Kunne ikke lese filen: {e}")
     st.stop()
@@ -2367,6 +2778,141 @@ elif valg == "Prosjektering":
         if not excel_qa_df.empty:
             with st.expander("Excel – QA_IFC_kontroll"):
                 st.dataframe(excel_qa_df, use_container_width=True, hide_index=True)
+
+
+elif valg == "Bygggenerator":
+    st.header("🏗️ Bygggenerator")
+    st.caption("Generer et råbygg direkte i appen. Modulen bruker samme logikk som Excel-arket: grid/fag, etasjer, geometri, dekker og materialkvaliteter.")
+
+    with st.expander("Hva gjør denne modulen?", expanded=True):
+        st.markdown("""
+        - Velg **geometri**: rektangel, L-form/tilbygg og eventuelt åpning i dekke.  
+        - Velg **etasjer og høyder**.  
+        - Velg **materiale og kvalitet** for bjelker, søyler og dekker.  
+        - Appen genererer ramme, dekker, mengder, vekt, kostnad og CO₂ som et tidligfaseforslag.
+        """)
+
+    st.subheader("1. Geometri og etasjer")
+    g1, g2, g3, g4 = st.columns(4)
+    bg_params = {}
+    with g1:
+        planvalg = st.selectbox("Geometri", ["Rektangel", "L-form / tilbygg", "Rektangel med åpning", "L-form med åpning"])
+        bg_params["fag_x_r1"] = st.number_input("Fag X", min_value=1, max_value=20, value=4, step=1, key="bg_fx")
+        bg_params["fag_y_r1"] = st.number_input("Fag Y", min_value=1, max_value=10, value=2, step=1, key="bg_fy")
+    with g2:
+        bg_params["faglengde_x_mm"] = st.number_input("Faglengde X [mm]", min_value=1000, max_value=20000, value=8000, step=500, key="bg_dx")
+        bg_params["faglengde_y_mm"] = st.number_input("Faglengde Y [mm]", min_value=1000, max_value=20000, value=12000, step=500, key="bg_dy")
+    with g3:
+        bg_params["antall_etasjer"] = st.number_input("Antall etasjer", min_value=1, max_value=10, value=3, step=1, key="bg_levels")
+        bg_params["dekker_i_modell"] = bg_params["antall_etasjer"]
+        bg_params["etasjehoyde_mm"] = st.number_input("Etasjehøyde [mm]", min_value=2200, max_value=6000, value=3000, step=100, key="bg_floor_height")
+    with g4:
+        bg_params["dekke_tykkelse_mm"] = st.number_input("Dekketøykkelse [mm]", min_value=100, max_value=600, value=300, step=10, key="bg_slab_thk")
+        bg_params["dekker_aktiv"] = "JA" if st.toggle("Generer dekker", value=True, key="bg_slabs_on") else "NEI"
+
+    use_r2 = planvalg in ["L-form / tilbygg", "L-form med åpning"]
+    use_opening = planvalg in ["Rektangel med åpning", "L-form med åpning"]
+    bg_params["rektangel2_aktiv"] = "JA" if use_r2 else "NEI"
+    if use_r2:
+        r1, r2, r3, r4 = st.columns(4)
+        with r1:
+            bg_params["fag_x_r2"] = st.number_input("Tilbygg fag X", min_value=1, max_value=20, value=2, step=1, key="bg_r2_fx")
+        with r2:
+            bg_params["fag_y_r2"] = st.number_input("Tilbygg fag Y", min_value=1, max_value=10, value=2, step=1, key="bg_r2_fy")
+        with r3:
+            bg_params["r2_offset_x_fag"] = st.number_input("Tilbygg offset X [fag]", min_value=0, max_value=20, value=2, step=1, key="bg_r2_ox")
+        with r4:
+            bg_params["r2_offset_y_fag"] = st.number_input("Tilbygg offset Y [fag]", min_value=0, max_value=10, value=0, step=1, key="bg_r2_oy")
+    else:
+        bg_params.update({"fag_x_r2": 0, "fag_y_r2": 0, "r2_offset_x_fag": 0, "r2_offset_y_fag": 0})
+
+    if use_opening:
+        o1, o2, o3, o4 = st.columns(4)
+        with o1:
+            bg_params["opening_width_fag"] = st.number_input("Åpning bredde [fag]", min_value=1, max_value=10, value=1, step=1, key="bg_ow")
+        with o2:
+            bg_params["opening_height_fag"] = st.number_input("Åpning høyde [fag]", min_value=1, max_value=10, value=1, step=1, key="bg_oh")
+        with o3:
+            bg_params["opening_offset_x_fag"] = st.number_input("Åpning offset X [fag]", min_value=0, max_value=20, value=1, step=1, key="bg_oox")
+        with o4:
+            bg_params["opening_offset_y_fag"] = st.number_input("Åpning offset Y [fag]", min_value=0, max_value=10, value=1, step=1, key="bg_ooy")
+    else:
+        bg_params.update({"opening_width_fag": 0, "opening_height_fag": 0, "opening_offset_x_fag": 0, "opening_offset_y_fag": 0})
+
+    st.subheader("2. Materiale og kvalitet")
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        bg_params["bjelkemateriale"] = st.selectbox("Bjelkemateriale", ["Stål", "Limtre"], key="bg_beam_mat")
+        bg_params["bjelkekvalitet"] = st.selectbox("Bjelkekvalitet", quality_options(bg_params["bjelkemateriale"]), key="bg_beam_qual")
+        beam_profiles = PROFILE_LIBRARY.get(bg_params["bjelkemateriale"], PROFILE_LIBRARY["Stål"])
+        bg_params["bjelkeprofil"] = st.selectbox("Bjelkeprofil", beam_profiles, key="bg_beam_prof")
+    with m2:
+        bg_params["søylemateriale"] = st.selectbox("Søylemateriale", ["Stål", "Limtre", "Betong"], key="bg_col_mat")
+        bg_params["søylekvalitet"] = st.selectbox("Søylekvalitet", quality_options(bg_params["søylemateriale"]), key="bg_col_qual")
+        col_profiles = PROFILE_LIBRARY.get(bg_params["søylemateriale"], PROFILE_LIBRARY["Betong"])
+        bg_params["søyleprofil"] = st.selectbox("Søyleprofil", col_profiles, key="bg_col_prof")
+    with m3:
+        bg_params["dekke_materialtype"] = st.selectbox("Dekkemateriale", ["Betong", "Massivtre"], key="bg_deck_mat")
+        bg_params["dekke_kvalitet"] = st.selectbox("Dekkekvalitet", quality_options(bg_params["dekke_materialtype"]), key="bg_deck_qual")
+        bg_params["skalltype"] = st.selectbox("Skalltype", ["Platt skall", "Hulldekke-prinsipp", "Massivtredekke"], key="bg_shell")
+        bg_params["dekke_materiale"] = make_material_profile_label(bg_params["dekke_materialtype"], bg_params["dekke_kvalitet"], f"t={bg_params['dekke_tykkelse_mm']:.0f} mm")
+
+    geom = generate_plan_geometry(bg_params)
+    frame_df = generate_frame_export_parametric(bg_params)
+    slab_df = generate_slab_export(bg_params) if bg_params["dekker_aktiv"] == "JA" else pd.DataFrame()
+    qty_df = frame_to_quantity_dataset(frame_df, slab_df, bg_params)
+    qa_df = run_project_qa(bg_params, frame_df, slab_df if not slab_df.empty else pd.DataFrame(columns=["DeckID"]))
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    with k1: metric_card("Planform", geom["planformkode"])
+    with k2: metric_card("Aktivt areal", f"{geom['active_area_m2']:,.1f} m²".replace(",", " "))
+    with k3: metric_card("Elementer", f"{len(qty_df):,}".replace(",", " "))
+    with k4: metric_card("Kostnad", f"{qty_df['Kostnad [kr]'].sum():,.0f} kr".replace(",", " "))
+    with k5: metric_card("CO₂", f"{qty_df['CO2 [kgCO2e]'].sum():,.0f} kgCO₂e".replace(",", " "))
+
+    p_left, p_right = st.columns([1, 1.15])
+    with p_left:
+        st.subheader("3. 2D-plan")
+        st.pyplot(plot_plan_geometry(geom))
+    with p_right:
+        st.subheader("4. 3D-prinsippmodell")
+        st.plotly_chart(plot_frame_3d(frame_df, slab_df), use_container_width=True)
+
+    st.subheader("5. Mengder, vekt, kostnad og CO₂")
+    st.dataframe(qty_df, use_container_width=True, hide_index=True, height=430)
+
+    sum_df = qty_df.groupby(["Type", "materiale", "Materialkvalitet"], dropna=False).agg(
+        Antall=("Segment", "count"),
+        Lengde_m=("Lengde [m]", "sum"),
+        Areal_m2=("Areal [m2]", "sum"),
+        Volum_m3=("Volum [m3]", "sum"),
+        Vekt_kg=("Vekt [kg]", "sum"),
+        Kostnad_kr=("Kostnad [kr]", "sum"),
+        CO2_kg=("CO2 [kgCO2e]", "sum"),
+    ).reset_index()
+    st.subheader("6. Oppsummering")
+    st.dataframe(sum_df, use_container_width=True, hide_index=True)
+
+    with st.expander("QA-kontroll"):
+        st.dataframe(qa_df, use_container_width=True, hide_index=True)
+
+    dl1, dl2, dl3, dl4 = st.columns(4)
+    with dl1:
+        st.download_button("Last ned mengder CSV", qty_df.to_csv(index=False).encode("utf-8-sig"), file_name="bygggenerator_mengder.csv", mime="text/csv")
+    with dl2:
+        st.download_button("Last ned ramme CSV", frame_df.to_csv(index=False).encode("utf-8-sig"), file_name="bygggenerator_ramme.csv", mime="text/csv")
+    with dl3:
+        if not slab_df.empty:
+            st.download_button("Last ned dekker CSV", slab_df.to_csv(index=False).encode("utf-8-sig"), file_name="bygggenerator_dekker.csv", mime="text/csv")
+    with dl4:
+        if ifcopenshell is None:
+            st.warning("IFC-eksport krever at `ifcopenshell` ligger i requirements.txt.")
+        else:
+            try:
+                ifc_out = generate_building_ifc_bytes(frame_df, slab_df, bg_params)
+                st.download_button("Last ned bygg IFC", data=ifc_out, file_name="bygggenerator_generert_bygg.ifc", mime="application/octet-stream")
+            except Exception as e:
+                st.error(f"Kunne ikke generere IFC: {e}")
 
 elif valg == "Rapport":
     st.header("📝 Rapport og eksport")
