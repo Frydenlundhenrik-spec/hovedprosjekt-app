@@ -1,4 +1,3 @@
-
 import io
 import math
 import os
@@ -40,11 +39,35 @@ except Exception:
     SimpleDocTemplate = None
 
 
+# ---------------------------------------------------------------------------
+# MODUL-OVERSIKT
+# Denne filen er hoved-app. Logikk er delt i:
+#   materials.py  – alle databaser og konstanter
+#   geometry.py   – terreng og konveks hull
+#   ifc_utils.py  – IFC-lesing og materialbytte
+#   reports.py    – DOCX/PDF-eksport
+# ---------------------------------------------------------------------------
 st.set_page_config(
     page_title="byggTotal – Mengder, kalkyle, IFC og prosjektering",
     page_icon="🏗️",
     layout="wide",
 )
+
+# ---------------------------------------------------------------------------
+# Session state – initialiseres før resten av appen kjøres
+# ---------------------------------------------------------------------------
+if "deck_variant_key" not in st.session_state:
+    st.session_state["deck_variant_key"] = "Hulldekke"
+if "concrete_variant_key" not in st.session_state:
+    st.session_state["concrete_variant_key"] = "Plasstøpt_betong"
+if "wall_variant_key" not in st.session_state:
+    st.session_state["wall_variant_key"] = "Betong_vegg"
+if "breeam_target_level" not in st.session_state:
+    st.session_state["breeam_target_level"] = "Ingen"
+if "breeam_active" not in st.session_state:
+    st.session_state["breeam_active"] = False
+
+
 
 st.markdown("""
 <style>
@@ -88,6 +111,9 @@ SUPPORTED_IFC_TYPES = [
 IFC_GEOMETRY_FALLBACK_TYPES = {"IfcSlab", "IfcBeam", "IfcColumn"}
 MAX_PROFILE_OPTIONS_DEFAULT = 100
 
+
+# Priser fra Norsk Prisbok 2024 – oppdater PRICE_VERSION i materials.py ved ny utgave
+PRICE_VERSION = "Norsk Prisbok 2024"
 
 MATERIAL_DATABASE = {
     "Stål": {"unit": "kg", "price": 47.0, "co2": 0.73, "density": 7850.0, "label": "Stål"},
@@ -537,7 +563,7 @@ def generate_ground_obj(points_df: pd.DataFrame) -> bytes:
         lines.append(f"v {row.X:.4f} {row.Y:.4f} {row.Z:.4f}")
     for a, b, c in tri.triangles:
         lines.append(f"f {a+1} {b+1} {c+1}")
-    RETURNPLACEHOLDER
+    return "\n".join(lines).encode("utf-8")
 
 
 def plot_ground_points(points_df: pd.DataFrame, hull=None):
@@ -1545,8 +1571,12 @@ def generate_slab_export(params: dict) -> pd.DataFrame:
     rectangles = geom["rectangles"]
     opening = geom["opening"]
 
+    etasjeh_mm = safe_num(params.get("etasjehoyde_mm", 3000))
+    if etasjeh_mm <= 0:
+        etasjeh_mm = 3000
+
     for i in range(n_decks):
-        z_mm = int(round((i + 1) * 4000))
+        z_mm = int(round((i + 1) * etasjeh_mm))
         if len(rectangles) == 1 and not opening:
             r = rectangles[0]
             pts = [(r["x"], r["y"]), (r["x"] + r["width"], r["y"]), (r["x"] + r["width"], r["y"] + r["height"]), (r["x"], r["y"] + r["height"])]
@@ -2138,6 +2168,404 @@ def generate_building_ifc_bytes(frame_df: pd.DataFrame, slab_df: pd.DataFrame, p
         except Exception:
             pass
 
+
+def generate_complete_ifc_bytes(
+    frame_df: pd.DataFrame,
+    slab_df: pd.DataFrame,
+    params: dict,
+    ground_layers: list | None = None,
+    gwl_depth_m: float | None = None,
+    foundation_key: str | None = None,
+    foundation_area_m2: float = 0.0,
+    pile_lm: float = 0.0,
+    n_piles: int = 0,
+    pile_length_m: float = 0.0,
+    site_area_m2: float = 0.0,
+    project_name: str = "byggTotal – komplett modell",
+    building_offset_x: float = 0.0,
+    building_offset_y: float = 0.0,
+    building_rotation_deg: float = 0.0,
+) -> bytes:
+    """Genererer en komplett IFC4-fil med konstruksjon OG grunnforhold.
+
+    Grunnforhold modelleres som:
+    - IfcGeographicElement (terreng/tomt)
+    - IfcFooting (fundamentplate eller stripe)
+    - IfcPile (peler)
+    - IfcBuildingElementProxy (geotekniske lag)
+    Konstruksjon er identisk med generate_building_ifc_bytes.
+    """
+    if ifcopenshell is None:
+        raise ImportError("ifcopenshell er ikke installert.")
+
+    from ground_module import SOIL_DATABASE, FOUNDATION_DATABASE
+
+    model = ifcopenshell.file(schema="IFC4")
+    origin = _ifc_axis3d(model)
+    context = model.create_entity(
+        "IfcGeometricRepresentationContext",
+        ContextIdentifier="Model", ContextType="Model",
+        CoordinateSpaceDimension=3, Precision=1e-5,
+        WorldCoordinateSystem=origin,
+    )
+    units = model.create_entity("IfcUnitAssignment", Units=[
+        model.create_entity("IfcSIUnit", UnitType="LENGTHUNIT", Name="METRE"),
+        model.create_entity("IfcSIUnit", UnitType="AREAUNIT", Name="SQUARE_METRE"),
+        model.create_entity("IfcSIUnit", UnitType="VOLUMEUNIT", Name="CUBIC_METRE"),
+    ])
+    project = model.create_entity("IfcProject", GlobalId=_ifc_guid(), Name=project_name,
+                                   RepresentationContexts=[context], UnitsInContext=units)
+    import math as _ifc_math
+
+    site_placement = _ifc_local_placement(model)
+    site = model.create_entity("IfcSite", GlobalId=_ifc_guid(), Name="Tomt",
+                                ObjectPlacement=site_placement)
+
+    # Bygg plasseres med offset og rotasjon relativt til tomten
+    _rot_rad = _ifc_math.radians(building_rotation_deg)
+    _cos_r   = _ifc_math.cos(_rot_rad)
+    _sin_r   = _ifc_math.sin(_rot_rad)
+    # IFC-rotasjon: RefDirection angir X-aksen, Axis angir Z-aksen
+    _rot_axis      = _ifc_dir(model, 0.0, 0.0, 1.0)
+    _rot_ref_dir   = _ifc_dir(model, _cos_r, _sin_r, 0.0)
+    building_placement = _ifc_local_placement(
+        model, site_placement,
+        building_offset_x, building_offset_y, 0.0,
+        _rot_axis, _rot_ref_dir,
+    )
+    building = model.create_entity("IfcBuilding", GlobalId=_ifc_guid(), Name="Generert råbygg",
+                                    ObjectPlacement=building_placement)
+    model.create_entity("IfcRelAggregates", GlobalId=_ifc_guid(),
+                         RelatingObject=project, RelatedObjects=[site])
+    model.create_entity("IfcRelAggregates", GlobalId=_ifc_guid(),
+                         RelatingObject=site, RelatedObjects=[building])
+
+    n_levels = max(int(round(safe_num(params.get("antall_etasjer", 1)))), 1)
+    etasjeh = safe_num(params.get("etasjehoyde_mm", 3000)) / 1000.0
+    if etasjeh <= 0:
+        etasjeh = 3.0
+
+    # Beregn byggets faktiske fotavtrykk fra frame_df-koordinater
+    # Dette sikrer at fundament og konstruksjon alltid bruker samme dimensjoner
+    if frame_df is not None and not frame_df.empty:
+        _all_x = []
+        _all_y = []
+        for _c in ["X1 [m]", "X2 [m]"]:
+            if _c in frame_df.columns:
+                _all_x += frame_df[_c].tolist()
+        for _c in ["Y1 [m]", "Y2 [m]"]:
+            if _c in frame_df.columns:
+                _all_y += frame_df[_c].tolist()
+        _bx = max(_all_x) - min(_all_x) if _all_x else 10.0
+        _by = max(_all_y) - min(_all_y) if _all_y else 10.0
+        _x0 = min(_all_x) if _all_x else 0.0
+        _y0 = min(_all_y) if _all_y else 0.0
+    else:
+        _fag_x = safe_num(params.get("fag_x_r1", 4))
+        _fag_y = safe_num(params.get("fag_y_r1", 2))
+        _dx    = safe_num(params.get("faglengde_x_mm", 8000)) / 1000.0
+        _dy    = safe_num(params.get("faglengde_y_mm", 12000)) / 1000.0
+        _bx = _fag_x * _dx if _fag_x > 0 and _dx > 0 else max(foundation_area_m2 ** 0.5, 1.0)
+        _by = _fag_y * _dy if _fag_y > 0 and _dy > 0 else max(foundation_area_m2 ** 0.5, 1.0)
+        _x0, _y0 = 0.0, 0.0
+
+    # Beregn total grunnlagsdybde så bygget kan løftes opp
+    total_ground_depth = 0.0
+    if ground_layers:
+        total_ground_depth = sum(float(l["thickness_m"]) for l in ground_layers)
+    fd_thk_lift = 0.3 if (foundation_key and foundation_area_m2 > 0) else 0.0
+    building_z_offset = fd_thk_lift  # bygget starter på toppen av fundamentplaten
+
+    storeys = {}
+    storey_children = {i: [] for i in range(1, n_levels + 1)}
+    storey_list = []
+    for level in range(1, n_levels + 1):
+        z = building_z_offset + (level - 1) * etasjeh
+        sp = _ifc_local_placement(model, building_placement, 0, 0, z)
+        storey = model.create_entity("IfcBuildingStorey", GlobalId=_ifc_guid(),
+                                      Name=f"Etasje {level}", ObjectPlacement=sp, Elevation=z)
+        storeys[level] = storey
+        storey_list.append(storey)
+    model.create_entity("IfcRelAggregates", GlobalId=_ifc_guid(),
+                         RelatingObject=building, RelatedObjects=storey_list)
+
+    material_entities = {}
+    def get_material(name):
+        name = str(name or "Ukjent")
+        if name not in material_entities:
+            material_entities[name] = model.create_entity("IfcMaterial", Name=name)
+        return material_entities[name]
+    def assign_material(product, mat_name):
+        model.create_entity("IfcRelAssociatesMaterial", GlobalId=_ifc_guid(),
+                             RelatedObjects=[product], RelatingMaterial=get_material(mat_name))
+
+    beam_mat = params.get("bjelkemateriale", "Stål")
+    beam_quality = params.get("bjelkekvalitet", "S355")
+    beam_profile = params.get("bjelkeprofil", "KFHUP 200x200x12.5")
+    col_mat = params.get("søylemateriale", "Stål")
+    col_quality = params.get("søylekvalitet", "S355")
+    col_profile = params.get("søyleprofil", "KFHUP 200x200x12.5")
+    deck_mat = params.get("dekke_materialtype", "Betong")
+    deck_quality = params.get("dekke_kvalitet", "B35")
+    deck_thk = safe_num(params.get("dekke_tykkelse_mm", 300)) / 1000.0
+    if deck_thk <= 0:
+        deck_thk = 0.3
+
+    def _world_xy(lx, ly):
+        """Transformer lokal (lx,ly) i byggets koordinatsystem til verdenskoordinater."""
+        return (
+            building_offset_x + lx * _cos_r - ly * _sin_r,
+            building_offset_y + lx * _sin_r + ly * _cos_r,
+        )
+
+    if frame_df is not None and not frame_df.empty:
+        for _, r in frame_df.iterrows():
+            typ = str(r.get("Type", ""))
+            level = max(int(round(safe_num(r.get("Nivå", 1)))), 1)
+            # Lokal posisjon i bygget
+            lx1, ly1 = safe_num(r.get("X1 [m]")), safe_num(r.get("Y1 [m]"))
+            lx2, ly2 = safe_num(r.get("X2 [m]")), safe_num(r.get("Y2 [m]"))
+            z1 = safe_num(r.get("Z1 [m]")) + building_z_offset
+            z2 = safe_num(r.get("Z2 [m]")) + building_z_offset
+            # Verdenskoordinater
+            wx1, wy1 = _world_xy(lx1, ly1)
+            wx2, wy2 = _world_xy(lx2, ly2)
+            axis, ref, length = _beam_orientation(model, wx1, wy1, z1, wx2, wy2, z2)
+            if typ == "Søyle":
+                w, h = _get_profile_dims_m(col_profile, col_mat, fallback=(0.3, 0.3))
+                shape = _ifc_product_shape(model, context, w, h, length)
+                placement = _ifc_local_placement(model, site_placement, wx1, wy1, z1, axis, ref)
+                product = model.create_entity("IfcColumn", GlobalId=_ifc_guid(),
+                                               Name=str(r.get("ID", "Søyle")),
+                                               ObjectPlacement=placement, Representation=shape)
+                assign_material(product, f"{col_mat} {col_quality}")
+            else:
+                w, h = _get_profile_dims_m(beam_profile, beam_mat, fallback=(0.2, 0.3))
+                shape = _ifc_product_shape(model, context, w, h, length)
+                placement = _ifc_local_placement(model, site_placement, wx1, wy1, z1, axis, ref)
+                product = model.create_entity("IfcBeam", GlobalId=_ifc_guid(),
+                                               Name=str(r.get("ID", "Bjelke")),
+                                               ObjectPlacement=placement, Representation=shape)
+                assign_material(product, f"{beam_mat} {beam_quality}")
+            if level in storey_children:
+                storey_children[level].append(product)
+
+    if slab_df is not None and not slab_df.empty:
+        for _, r in slab_df.iterrows():
+            level = max(int(round(safe_num(r.get("Nivå", 1)))), 1)
+            pts = []
+            for i in range(1, 9):
+                raw = str(r.get(f"P{i} (X,Y)", "") or "")
+                nums = [float(x.strip()) / 1000.0 for x in raw.split(",") if x.strip().replace("-", "").replace(".", "").isdigit()]
+                if len(nums) == 2:
+                    pts.append(tuple(nums))
+            if len(pts) >= 3:
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                xmin, xmax = min(xs), max(xs)
+                ymin, ymax = min(ys), max(ys)
+                width = max(xmax - xmin, 0.001)
+                depth_slab = max(ymax - ymin, 0.001)
+                z_top = safe_num(r.get("Z [mm]", level * etasjeh * 1000)) / 1000.0 + building_z_offset
+                # Senter av dekke i lokal -> verdenskoordinater
+                s_lx = xmin + width / 2.0
+                s_ly = ymin + depth_slab / 2.0
+                s_wx, s_wy = _world_xy(s_lx, s_ly)
+                shape = _ifc_product_shape(model, context, width, depth_slab, deck_thk)
+                placement = _ifc_local_placement(model, site_placement,
+                                                  s_wx, s_wy, z_top - deck_thk,
+                                                  _ifc_dir(model, 0, 0, 1),
+                                                  _ifc_dir(model, _cos_r, _sin_r, 0.0))
+                slab = model.create_entity("IfcSlab", GlobalId=_ifc_guid(),
+                                            Name=str(r.get("DeckID", f"Dekke {level}")),
+                                            ObjectPlacement=placement, Representation=shape,
+                                            PredefinedType="FLOOR")
+                assign_material(slab, f"{deck_mat} {deck_quality}")
+                if level in storey_children:
+                    storey_children[level].append(slab)
+
+    for level, children in storey_children.items():
+        if children:
+            model.create_entity("IfcRelContainedInSpatialStructure", GlobalId=_ifc_guid(),
+                                 RelatedElements=children, RelatingStructure=storeys[level])
+
+    # -----------------------------------------------------------------------
+    # GRUNNFORHOLD
+    # -----------------------------------------------------------------------
+    ground_elements = []
+
+    # Grunnvannsnivå – sentrert under bygget, samme plassering som jordlag
+    if gwl_depth_m is not None:
+        gwl_z = -gwl_depth_m
+        _gwl_local_cx = _x0 + _bx / 2.0
+        _gwl_local_cy = _y0 + _by / 2.0
+        _gwl_cx = building_offset_x + _gwl_local_cx * _cos_r - _gwl_local_cy * _sin_r
+        _gwl_cy = building_offset_y + _gwl_local_cx * _sin_r + _gwl_local_cy * _cos_r
+        gwl_placement = _ifc_local_placement(
+            model, site_placement,
+            _gwl_cx, _gwl_cy, gwl_z,
+            _ifc_dir(model, 0.0, 0.0, 1.0),
+            _ifc_dir(model, _cos_r, _sin_r, 0.0),
+        )
+        gwl_shape = _ifc_product_shape(model, context, _bx, _by, 0.05)
+        gwl_elem = model.create_entity(
+            "IfcBuildingElementProxy", GlobalId=_ifc_guid(),
+            Name=f"Grunnvannsnivå (GVN) -{gwl_depth_m:.1f} m",
+            ObjectPlacement=gwl_placement, Representation=gwl_shape,
+        )
+        assign_material(gwl_elem, "Grunnvann")
+        ground_elements.append(gwl_elem)
+
+    # Geotekniske lag med farge per jordart
+    def _hex_to_ifc_rgb(hex_color: str):
+        """Konverterer hex-farge (#RRGGBB) til IFC IfcColourRgb (0.0–1.0)."""
+        h = hex_color.lstrip("#")
+        r = int(h[0:2], 16) / 255.0
+        g = int(h[2:4], 16) / 255.0
+        b = int(h[4:6], 16) / 255.0
+        return r, g, b
+
+    def _assign_colored_material(product, mat_name: str, hex_color: str):
+        """Tilordner materiale med farge (IfcStyledItem) til et produkt."""
+        mat = get_material(mat_name)
+        try:
+            r, g, b = _hex_to_ifc_rgb(hex_color)
+            colour = model.create_entity("IfcColourRgb", Name=mat_name, Red=r, Green=g, Blue=b)
+            surface_style_rendering = model.create_entity(
+                "IfcSurfaceStyleRendering",
+                SurfaceColour=colour,
+                Transparency=0.15,
+                ReflectanceMethod="FLAT",
+            )
+            surface_style = model.create_entity(
+                "IfcSurfaceStyle",
+                Name=mat_name,
+                Side="BOTH",
+                Styles=[surface_style_rendering],
+            )
+            presentation_style = model.create_entity(
+                "IfcPresentationStyleAssignment",
+                Styles=[surface_style],
+            )
+            rep = product.Representation
+            if rep:
+                for item in rep.Representations:
+                    for shape_item in item.Items:
+                        model.create_entity(
+                            "IfcStyledItem",
+                            Item=shape_item,
+                            Styles=[presentation_style],
+                            Name=mat_name,
+                        )
+        except Exception:
+            pass  # Farge er valgfritt – produktet vises uansett
+        model.create_entity("IfcRelAssociatesMaterial", GlobalId=_ifc_guid(),
+                             RelatedObjects=[product], RelatingMaterial=mat)
+
+    if ground_layers:
+        depth = 0.0
+        # Jordlag sentreres under byggets faktiske fotavtrykk i verdenskoordinater
+        _local_cx = _x0 + _bx / 2.0
+        _local_cy = _y0 + _by / 2.0
+        _layer_cx = building_offset_x + _local_cx * _cos_r - _local_cy * _sin_r
+        _layer_cy = building_offset_y + _local_cx * _sin_r + _local_cy * _cos_r
+        for i, layer in enumerate(ground_layers):
+            soil_info = SOIL_DATABASE.get(layer["soil_type"], SOIL_DATABASE["Ukjent"])
+            thickness = float(layer["thickness_m"])
+            z_top = -depth
+            layer_placement = _ifc_local_placement(
+                model, site_placement,
+                _layer_cx, _layer_cy, z_top - thickness,
+                _ifc_dir(model, 0.0, 0.0, 1.0),
+                _ifc_dir(model, _cos_r, _sin_r, 0.0),
+            )
+            layer_shape = _ifc_product_shape(model, context, _bx, _by, thickness)
+            soil_elem = model.create_entity(
+                "IfcBuildingElementProxy", GlobalId=_ifc_guid(),
+                Name=f"Jordlag {i+1}: {soil_info['label']} ({thickness:.1f} m)",
+                ObjectPlacement=layer_placement, Representation=layer_shape,
+            )
+            hex_col = soil_info.get("color", "#AAAAAA")
+            _assign_colored_material(soil_elem, soil_info["label"], hex_col)
+            ground_elements.append(soil_elem)
+            depth += thickness
+
+    # Fundamentplate og peler – beregn verdenskoordinater manuelt
+    # slik at de IKKE arver byggets rotasjon og blir skjeve
+    if foundation_key and foundation_area_m2 > 0:
+        fd_info = FOUNDATION_DATABASE.get(foundation_key, {})
+        fd_label = fd_info.get("label", foundation_key)
+        fd_thk = 0.3
+        # Transformer senter av byggets faktiske fotavtrykk til verdenskoordinater
+        _local_cx = _x0 + _bx / 2.0
+        _local_cy = _y0 + _by / 2.0
+        _fd_cx = building_offset_x + _local_cx * _cos_r - _local_cy * _sin_r
+        _fd_cy = building_offset_y + _local_cx * _sin_r + _local_cy * _cos_r
+        fd_placement = _ifc_local_placement(
+            model, site_placement,
+            _fd_cx, _fd_cy, -fd_thk,
+            _ifc_dir(model, 0.0, 0.0, 1.0),
+            _ifc_dir(model, _cos_r, _sin_r, 0.0),
+        )
+        fd_shape = _ifc_product_shape(model, context, _bx, _by, fd_thk)
+        footing = model.create_entity(
+            "IfcFooting", GlobalId=_ifc_guid(),
+            Name=fd_label,
+            ObjectPlacement=fd_placement, Representation=fd_shape,
+            PredefinedType="PAD_FOOTING",
+        )
+        assign_material(footing, "Betong B35")
+        ground_elements.append(footing)
+
+    # Peler – transformer hvert punkt fra byggets lokale system til verdenskoordinater
+    if n_piles > 0 and pile_length_m > 0:
+        grid_n = max(int(n_piles ** 0.5), 1)
+        sp_x = _bx / max(grid_n, 1)
+        sp_y = _by / max(grid_n, 1)
+        pile_count = 0
+        for ix in range(grid_n):
+            for iy in range(grid_n):
+                if pile_count >= n_piles:
+                    break
+                _lx = _x0 + (ix + 0.5) * sp_x
+                _ly = _y0 + (iy + 0.5) * sp_y
+                _wx = building_offset_x + _lx * _cos_r - _ly * _sin_r
+                _wy = building_offset_y + _lx * _sin_r + _ly * _cos_r
+                pile_placement = _ifc_local_placement(
+                    model, site_placement, _wx, _wy, 0.0,
+                    _ifc_dir(model, 0.0, 0.0, -1.0),
+                    _ifc_dir(model, 1.0, 0.0, 0.0),
+                )
+                pile_shape = _ifc_product_shape(model, context, 0.3, 0.3, pile_length_m)
+                pile_elem = model.create_entity(
+                    "IfcPile", GlobalId=_ifc_guid(),
+                    Name=f"Pel {pile_count + 1}",
+                    ObjectPlacement=pile_placement, Representation=pile_shape,
+                    PredefinedType="COHESION",
+                )
+                assign_material(pile_elem, "Stålpel")
+                ground_elements.append(pile_elem)
+                pile_count += 1
+            if pile_count >= n_piles:
+                break
+
+    if ground_elements:
+        model.create_entity("IfcRelContainedInSpatialStructure", GlobalId=_ifc_guid(),
+                             RelatedElements=ground_elements, RelatingStructure=site)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp:
+        temp_path = tmp.name
+    try:
+        model.write(temp_path)
+        with open(temp_path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
+
 st.markdown("""
 <div class="custom-card">
     <div style="font-size:42px; font-weight:800; color:#1f2937;">byggTotal</div>
@@ -2153,7 +2581,7 @@ st.markdown("""
 st.sidebar.title("byggTotal")
 valg = st.sidebar.radio(
     "Velg side",
-    ["Mengder", "Grunn", "Materialbytte", "BREEAM", "CO₂-regnskap", "3D-modell", "Prosjektering", "Bygggenerator", "Rapport"],
+    ["3D-modell", "Bygggenerator", "Grunn", "Materialbytte", "Rapport"],
 )
 
 with st.sidebar:
@@ -2249,6 +2677,12 @@ try:
             data = pd.DataFrame(columns=["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "materiale", "Materialkvalitet", "Endret IFC", "Mengdegrunnlag", "Kostnad [kr]", "CO2 [kgCO2e]"])
             nodes = pd.DataFrame()
             forside = pd.DataFrame()
+        elif valg in ["Grunn", "Rapport"]:
+            # Disse modulene krever ingen Excel/IFC-fil
+            filename = "Ingen fil lastet"
+            data = pd.DataFrame(columns=["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "materiale", "Endret IFC", "Mengdegrunnlag"])
+            nodes = pd.DataFrame()
+            forside = pd.DataFrame()
         else:
             st.info("Last opp en Excel-fil eller IFC-fil i sidepanelet for å starte analysen, eller velg Bygggenerator for å starte uten fil.")
             st.stop()
@@ -2256,7 +2690,8 @@ except Exception as e:
     st.error(f"Kunne ikke lese filen: {e}")
     st.stop()
 
-st.success(f"Aktiv fil: **{filename}**")
+if filename and filename != "Ingen fil lastet":
+    st.success(f"Aktiv fil: **{filename}**")
 
 for col in ["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "materiale", "Endret IFC", "Mengdegrunnlag"]:
     if col not in data.columns:
@@ -2393,128 +2828,392 @@ if valg == "Mengder":
             st.dataframe(data, use_container_width=True)
 
 elif valg == "Grunn":
-    st.header("🌍 Grunn")
+    from ground_module import (
+        SOIL_DATABASE, FOUNDATION_DATABASE, GROUND_CO2_DATABASE,
+        recommend_foundation, estimate_pile_length, calculate_foundation_cost,
+        calculate_ground_co2, load_geojson, load_dxf_points,
+        plot_soil_profile, plot_bearing_capacity_chart, groundwater_risk_assessment,
+        build_ground_report_df,
+    )
+
+    st.header("🌍 Grunn og georeferering")
     active_breeam_level = st.session_state.get("breeam_target_level", "Ingen") if st.session_state.get("breeam_active", False) else "Ingen"
-    st.caption("Last opp stikningsdata for tomta, beregn første anslag for terrengarbeider, sammenlign grunnsystemer og eksporter terrenggrunnlag som CSV eller OBJ-modell.")
 
-    stake_file = st.file_uploader("Last opp stikningsdata (.csv, .xlsx, .txt, .pts)", type=["csv", "xlsx", "xls", "txt", "pts"], key="stake_file")
+    ground_tab1, ground_tab2, ground_tab3, ground_tab4, ground_tab5 = st.tabs([
+        "📍 Stikningsdata / terreng",
+        "🗺️ Georeferering",
+        "🪨 Geoteknikk og profil",
+        "🏗️ Fundamentering og peling",
+        "🌿 CO₂-regnskap grunn",
+    ])
 
-    with st.expander("Forslag til arbeidsflyt for grunnjobben", expanded=True):
-        st.markdown(
-            """
-            1. Last opp stikningspunkter med kolonner for X, Y og Z, gjerne også punktkode.  
-            2. Kontroller tomteutbredelse og kotevariasjon i forhåndsvisningen.  
-            3. Velg prosjektkote eller la appen bruke middelkoten som første anslag.  
-            4. Velg grunnscenario og sammenlign kostnaden mot et alternativt scenario, omtrent som materialbytte.  
-            5. Aktiver BREEAM-scenario dersom prosjektet har miljømål, og la grunnkalkylen ta hensyn til dokumentasjon, overvann og masserebruk.  
-            6. Eksporter terrenggrunnlag som CSV eller OBJ for videre bruk i andre verktøy.
-            """
-        )
+    # -----------------------------------------------------------------------
+    # TAB 1 – STIKNINGSDATA OG TERRENG
+    # -----------------------------------------------------------------------
+    with ground_tab1:
+        st.subheader("Stikningsdata og terrengmodell")
+        st.caption("Last opp stikningspunkter (CSV, Excel, TXT, PTS). Appen beregner terrengvolum, tomteareal og første anslag for masser.")
 
-    if active_breeam_level != "Ingen":
-        st.info(f"Aktivt BREEAM-scenario: {active_breeam_level}. Grunnkalkylen justeres med miljøpåslag, masserebruk og eventuelle overvannstiltak.")
+        stake_file = st.file_uploader("Last opp stikningsdata (.csv, .xlsx, .txt, .pts)", type=["csv", "xlsx", "xls", "txt", "pts"], key="stake_file_v2")
 
-    if stake_file is None:
-        st.info("Last opp stikningsdata for å aktivere grunnmodulen.")
-    else:
-        try:
-            stake_df = load_stake_data(stake_file)
-        except Exception as e:
-            st.error(f"Kunne ikke lese stikningsdata: {e}")
-            stake_df = pd.DataFrame()
-
-        if not stake_df.empty:
-            default_target = float(stake_df["Z"].mean())
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                use_mean_level = st.toggle("Bruk middelkote som prosjektkote", value=True, key="ground_use_mean")
-            with c2:
-                target_elevation = st.number_input("Prosjektkote [m]", value=default_target, step=0.10, format="%.2f", disabled=use_mean_level)
-            with c3:
-                mass_factor = st.number_input("Usikkerhets-/massefaktor", min_value=0.50, max_value=2.00, value=1.15, step=0.05)
-
-            if use_mean_level:
-                target_elevation = default_target
-
-            summary_ground, evaluated_points, hull = build_ground_summary(stake_df, target_elevation=target_elevation, mass_factor=mass_factor)
-
-            p1, p2, p3, p4, p5, p6 = st.columns(6)
-            with p1:
-                metric_card("Punkt", f"{summary_ground['Antall punkt']:,}".replace(",", " "))
-            with p2:
-                metric_card("Tomteareal", f"{summary_ground['Tomteareal (konveks hull)']:,.1f} m²".replace(",", " "))
-            with p3:
-                metric_card("Prosjektkote", f"{summary_ground['Prosjektkote']:.2f} m")
-            with p4:
-                metric_card("Utgraving", f"{summary_ground['Estimert utgraving']:,.1f} m³".replace(",", " "))
-            with p5:
-                metric_card("Oppfylling", f"{summary_ground['Estimert oppfylling']:,.1f} m³".replace(",", " "))
-            with p6:
-                metric_card("Punktavstand", f"{summary_ground['Punktavstand ca.']:.2f} m")
-
-            left, right = st.columns([1.1, 1])
-            with left:
-                st.subheader("Tomteutbredelse")
-                st.pyplot(plot_ground_points(evaluated_points, hull))
-                summary_df = pd.DataFrame({
-                    "Parameter": list(summary_ground.keys()),
-                    "Verdi": list(summary_ground.values()),
-                })
-                st.dataframe(summary_df, use_container_width=True, hide_index=True)
-            with right:
-                st.subheader("Punktfordeling per kode")
-                code_df = evaluated_points.groupby("Kode", dropna=False).size().reset_index(name="Antall")
-                st.dataframe(code_df, use_container_width=True, hide_index=True)
-
-            st.subheader("Terrengsystem / grunnjobbscenario")
-            g1, g2, g3 = st.columns(3)
-            with g1:
-                current_ground_system = st.selectbox("Dagens / basis scenario", list(GROUND_SYSTEM_LIBRARY.keys()), index=0)
-            with g2:
-                target_ground_system = st.selectbox("Nytt scenario", list(GROUND_SYSTEM_LIBRARY.keys()), index=min(1, len(GROUND_SYSTEM_LIBRARY)-1))
-            with g3:
-                ground_breeam_level = st.selectbox("BREEAM-nivå for grunnkalkyle", BREEAM_LEVELS, index=BREEAM_LEVELS.index(active_breeam_level) if active_breeam_level in BREEAM_LEVELS else 0)
-
-            current_price_df = build_ground_pricing_basis_v2(summary_ground, current_ground_system, ground_breeam_level)
-            target_price_df = build_ground_pricing_basis_v2(summary_ground, target_ground_system, ground_breeam_level)
-            ground_compare_df = compare_ground_scenarios(summary_ground, current_ground_system, target_ground_system, ground_breeam_level)
-
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                metric_card("Basis kostnad", f"{current_price_df['Beløp'].sum():,.0f} kr".replace(",", " "))
-            with m2:
-                metric_card("Nytt scenario", f"{target_price_df['Beløp'].sum():,.0f} kr".replace(",", " "))
-            with m3:
-                metric_card("Endring", f"{(target_price_df['Beløp'].sum() - current_price_df['Beløp'].sum()):,.0f} kr".replace(",", " "))
-            with m4:
-                metric_card("Aktivt nivå", ground_breeam_level)
-
-            c_left, c_right = st.columns(2)
-            with c_left:
-                st.markdown("**Prisgrunnlag – basis**")
-                st.dataframe(current_price_df, use_container_width=True, hide_index=True)
-            with c_right:
-                st.markdown("**Prisgrunnlag – nytt scenario**")
-                st.dataframe(target_price_df, use_container_width=True, hide_index=True)
-
-            st.markdown("**Scenario-sammenligning**")
-            st.dataframe(ground_compare_df, use_container_width=True, hide_index=True)
-
-            st.subheader("Punktgrunnlag")
-            st.dataframe(evaluated_points, use_container_width=True, hide_index=True, height=420)
-
-            csv_bytes = evaluated_points.to_csv(index=False).encode("utf-8-sig")
-            price_csv = target_price_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("Last ned punktgrunnlag CSV", csv_bytes, file_name="grunn_punktgrunnlag.csv", mime="text/csv")
-            st.download_button("Last ned prisgrunnlag CSV", price_csv, file_name="grunn_prisgrunnlag.csv", mime="text/csv")
-
+        if stake_file is None:
+            st.info("Last opp stikningsdata for å aktivere terrengmodulen.")
+        else:
             try:
-                obj_bytes = generate_ground_obj(evaluated_points)
-                st.download_button("Last ned terrengmodell OBJ", obj_bytes, file_name="terrengmodell.obj", mime="text/plain")
+                stake_df = load_stake_data(stake_file)
             except Exception as e:
-                st.info(f"Kunne ikke generere OBJ-modell: {e}")
+                st.error(f"Kunne ikke lese stikningsdata: {e}")
+                stake_df = pd.DataFrame()
 
-            st.info("Videre steg for grunnmodulen: koble punktkoder mot maskinstyringsklasser, legge inn grøfter/kummer/VA og etter hvert eksportere et enklere terreng-IFC eller LandXML for videre prosjektering.")
+            if not stake_df.empty:
+                default_target = float(stake_df["Z"].mean())
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    use_mean_level = st.toggle("Bruk middelkote som prosjektkote", value=True, key="ground_use_mean_v2")
+                with c2:
+                    target_elevation = st.number_input("Prosjektkote [m]", value=default_target, step=0.10, format="%.2f", disabled=use_mean_level)
+                with c3:
+                    mass_factor = st.number_input("Usikkerhets-/massefaktor", min_value=0.50, max_value=2.00, value=1.15, step=0.05)
+                if use_mean_level:
+                    target_elevation = default_target
+
+                summary_ground, evaluated_points, hull = build_ground_summary(stake_df, target_elevation=target_elevation, mass_factor=mass_factor)
+
+                p1, p2, p3, p4, p5, p6 = st.columns(6)
+                with p1: metric_card("Punkt", f"{summary_ground['Antall punkt']:,}".replace(",", " "))
+                with p2: metric_card("Tomteareal", f"{summary_ground['Tomteareal (konveks hull)']:,.1f} m²".replace(",", " "))
+                with p3: metric_card("Prosjektkote", f"{summary_ground['Prosjektkote']:.2f} m")
+                with p4: metric_card("Utgraving", f"{summary_ground['Estimert utgraving']:,.1f} m³".replace(",", " "))
+                with p5: metric_card("Oppfylling", f"{summary_ground['Estimert oppfylling']:,.1f} m³".replace(",", " "))
+                with p6: metric_card("Punktavstand", f"{summary_ground['Punktavstand ca.']:.2f} m")
+                # Lagre til rapport
+                st.session_state["rapport_tomteareal"] = f"{summary_ground['Tomteareal (konveks hull)']:,.1f} m²".replace(",", " ")
+                st.session_state["rapport_utgraving"] = f"{summary_ground['Estimert utgraving']:,.1f} m³".replace(",", " ")
+                st.session_state["rapport_oppfylling"] = f"{summary_ground['Estimert oppfylling']:,.1f} m³".replace(",", " ")
+                st.session_state["rapport_prosjektkote"] = f"{summary_ground['Prosjektkote']:.2f} m"
+                st.session_state["rapport_antall_punkt"] = str(summary_ground['Antall punkt'])
+
+                left, right = st.columns([1.1, 1])
+                with left:
+                    st.subheader("Tomteutbredelse")
+                    st.pyplot(plot_ground_points(evaluated_points, hull))
+                    summary_df = pd.DataFrame({"Parameter": list(summary_ground.keys()), "Verdi": list(summary_ground.values())})
+                    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+                with right:
+                    st.subheader("Punktfordeling per kode")
+                    code_df = evaluated_points.groupby("Kode", dropna=False).size().reset_index(name="Antall")
+                    st.dataframe(code_df, use_container_width=True, hide_index=True)
+
+                st.subheader("Grunnjobbscenario")
+                g1, g2, g3 = st.columns(3)
+                with g1:
+                    current_ground_system = st.selectbox("Basis scenario", list(GROUND_SYSTEM_LIBRARY.keys()), index=0)
+                with g2:
+                    target_ground_system = st.selectbox("Alternativt scenario", list(GROUND_SYSTEM_LIBRARY.keys()), index=min(1, len(GROUND_SYSTEM_LIBRARY)-1))
+                with g3:
+                    ground_breeam_level = st.selectbox("BREEAM-nivå", BREEAM_LEVELS, index=BREEAM_LEVELS.index(active_breeam_level) if active_breeam_level in BREEAM_LEVELS else 0)
+
+                current_price_df = build_ground_pricing_basis_v2(summary_ground, current_ground_system, ground_breeam_level)
+                target_price_df = build_ground_pricing_basis_v2(summary_ground, target_ground_system, ground_breeam_level)
+                ground_compare_df = compare_ground_scenarios(summary_ground, current_ground_system, target_ground_system, ground_breeam_level)
+
+                m1, m2, m3, m4 = st.columns(4)
+                with m1: metric_card("Basis kostnad", f"{current_price_df['Beløp'].sum():,.0f} kr".replace(",", " "))
+                with m2: metric_card("Alternativt", f"{target_price_df['Beløp'].sum():,.0f} kr".replace(",", " "))
+                with m3: metric_card("Endring", f"{(target_price_df['Beløp'].sum() - current_price_df['Beløp'].sum()):,.0f} kr".replace(",", " "))
+                with m4: metric_card("BREEAM", ground_breeam_level)
+
+                cl, cr = st.columns(2)
+                with cl:
+                    st.markdown("**Prisgrunnlag – basis**")
+                    st.dataframe(current_price_df, use_container_width=True, hide_index=True)
+                with cr:
+                    st.markdown("**Prisgrunnlag – alternativt**")
+                    st.dataframe(target_price_df, use_container_width=True, hide_index=True)
+
+                st.dataframe(ground_compare_df, use_container_width=True, hide_index=True)
+                st.dataframe(evaluated_points, use_container_width=True, hide_index=True, height=320)
+
+                dl1, dl2, dl3 = st.columns(3)
+                with dl1:
+                    st.download_button("Last ned punktgrunnlag CSV", evaluated_points.to_csv(index=False).encode("utf-8-sig"), file_name="grunn_punktgrunnlag.csv", mime="text/csv")
+                with dl2:
+                    st.download_button("Last ned prisgrunnlag CSV", target_price_df.to_csv(index=False).encode("utf-8-sig"), file_name="grunn_prisgrunnlag.csv", mime="text/csv")
+                with dl3:
+                    try:
+                        obj_bytes = generate_ground_obj(evaluated_points)
+                        st.download_button("Last ned terrengmodell OBJ", obj_bytes, file_name="terrengmodell.obj", mime="text/plain")
+                    except Exception as e:
+                        st.info(f"OBJ-modell ikke tilgjengelig: {e}")
+
+    # -----------------------------------------------------------------------
+    # TAB 2 – GEOREFERERING
+    # -----------------------------------------------------------------------
+    with ground_tab2:
+        st.subheader("Georeferering – importer punktdata")
+        st.caption("Støtter GeoJSON, DXF (AutoCAD) og WMS/WFS-lenker fra f.eks. Geonorge.")
+
+        geo_format = st.radio("Velg format", ["GeoJSON", "DXF (AutoCAD)", "WMS/WFS-URL", "Stikningsdata (CSV/Excel)"], horizontal=True)
+
+        geo_df = pd.DataFrame()
+        geo_meta = {}
+
+        if geo_format == "GeoJSON":
+            geo_file = st.file_uploader("Last opp GeoJSON-fil", type=["geojson", "json"], key="geo_geojson")
+            if geo_file:
+                try:
+                    geo_df, geo_meta = load_geojson(geo_file)
+                    st.success(f"Leste {geo_meta['antall_punkt']} punkter fra GeoJSON.")
+                    if geo_meta.get("crs") and geo_meta["crs"] != "Ukjent CRS":
+                        st.info(f"CRS: {geo_meta['crs']}")
+                except Exception as e:
+                    st.error(f"Feil ved lesing av GeoJSON: {e}")
+
+        elif geo_format == "DXF (AutoCAD)":
+            dxf_file = st.file_uploader("Last opp DXF-fil", type=["dxf"], key="geo_dxf")
+            if dxf_file:
+                try:
+                    geo_df = load_dxf_points(dxf_file)
+                    st.success(f"Leste {len(geo_df)} punkter fra DXF.")
+                except ImportError:
+                    st.warning("DXF-støtte krever pakken `ezdxf`. Legg til `ezdxf` i requirements.txt og installer på nytt med `py -m pip install ezdxf`.")
+                except Exception as e:
+                    st.error(f"Feil ved lesing av DXF: {e}")
+
+        elif geo_format == "WMS/WFS-URL":
+            st.info("Lim inn en WMS/WFS-URL fra f.eks. Geonorge (https://www.geonorge.no/kart/)")
+            wms_url = st.text_input("WMS/WFS-URL", placeholder="https://wms.geonorge.no/skwms1/wms.fjell?SERVICE=WMS&...")
+            if wms_url:
+                info = parse_wms_bbox_from_url(wms_url) if wms_url else {}
+                if info:
+                    st.markdown("**Parsede parametere fra URL:**")
+                    st.json(info)
+                st.info("WMS/WFS gir kartvisning, ikke direkte punktdata. Eksporter punkter fra Geonorge som GeoJSON eller CSV og last opp her.")
+
+        elif geo_format == "Stikningsdata (CSV/Excel)":
+            stake_geo_file = st.file_uploader("Last opp stikningsdata", type=["csv", "xlsx", "xls", "txt", "pts"], key="geo_stake")
+            if stake_geo_file:
+                try:
+                    geo_df = load_stake_data(stake_geo_file)
+                    st.success(f"Leste {len(geo_df)} punkter.")
+                except Exception as e:
+                    st.error(f"Feil: {e}")
+
+        if not geo_df.empty:
+            st.subheader("Importerte punkter")
+            g1, g2, g3, g4 = st.columns(4)
+            with g1: metric_card("Punkter", str(len(geo_df)))
+            with g2: metric_card("X-spenn", f"{geo_df['X'].max() - geo_df['X'].min():.1f} m")
+            with g3: metric_card("Y-spenn", f"{geo_df['Y'].max() - geo_df['Y'].min():.1f} m")
+            with g4: metric_card("Z-min / maks", f"{geo_df['Z'].min():.1f} / {geo_df['Z'].max():.1f} m")
+
+            fig_geo, ax_geo = plt.subplots(figsize=(7, 5))
+            sc = ax_geo.scatter(geo_df["X"], geo_df["Y"], c=geo_df["Z"], s=15, cmap="terrain")
+            fig_geo.colorbar(sc, ax=ax_geo, label="Z / kote [m]")
+            ax_geo.set_xlabel("X (øst)")
+            ax_geo.set_ylabel("Y (nord)")
+            ax_geo.set_title("Georefererte punkter")
+            ax_geo.axis("equal")
+            st.pyplot(fig_geo)
+            plt.close(fig_geo)
+
+            st.dataframe(geo_df.head(200), use_container_width=True, hide_index=True)
+            st.download_button("Last ned som CSV", geo_df.to_csv(index=False).encode("utf-8-sig"), file_name="geo_punkter.csv", mime="text/csv")
+
+    # -----------------------------------------------------------------------
+    # TAB 3 – GEOTEKNIKK OG PROFIL
+    # -----------------------------------------------------------------------
+    with ground_tab3:
+        st.subheader("Geoteknisk lagprofil")
+        st.caption("Definer jordlag fra terreng og ned. Appen tegner geoteknisk profil og beregner bæreevne.")
+
+        n_layers = st.number_input("Antall jordlag", min_value=1, max_value=8, value=3, step=1)
+        layers = []
+        layer_cols = st.columns(min(int(n_layers), 4))
+        for i in range(int(n_layers)):
+            col = layer_cols[i % 4]
+            with col:
+                st.markdown(f"**Lag {i+1}**")
+                soil_type = st.selectbox(f"Jordart", list(SOIL_DATABASE.keys()), key=f"soil_type_{i}", index=min(i, len(SOIL_DATABASE)-1))
+                thickness = st.number_input(f"Tykkelse [m]", min_value=0.1, max_value=50.0, value=2.0 + i * 1.0, step=0.5, key=f"soil_thick_{i}")
+                layers.append({"soil_type": soil_type, "thickness_m": thickness})
+
+        gw_col1, gw_col2 = st.columns(2)
+        with gw_col1:
+            gwl_active = st.toggle("Angi grunnvannsnivå", value=True, key="gwl_active")
+        with gw_col2:
+            gwl_depth = st.number_input("Grunnvannsnivå – dybde fra terreng [m]", min_value=0.0, max_value=50.0, value=2.5, step=0.25, disabled=not gwl_active)
+
+        total_depth = sum(l["thickness_m"] for l in layers)
+
+        prof_col, prop_col = st.columns([1, 2])
+        with prof_col:
+            st.subheader("Geoteknisk profil")
+            fig_prof = plot_soil_profile(layers, gwl_depth if gwl_active else None)
+            st.pyplot(fig_prof)
+            plt.close(fig_prof)
+
+        with prop_col:
+            st.subheader("Laginformasjon")
+            report_df = build_ground_report_df(layers, gwl_depth if gwl_active else None,
+                                               "Platefundament_betong", 0, 0, 0, 0, 0)
+            st.dataframe(report_df, use_container_width=True, hide_index=True)
+
+            st.subheader("Bæreevne per jordart")
+            fig_bc = plot_bearing_capacity_chart(list(SOIL_DATABASE.keys()), 100.0)
+            st.pyplot(fig_bc)
+            plt.close(fig_bc)
+
+        if gwl_active:
+            st.subheader("Grunnvannsrisikovurdering")
+            foundation_depth_input = st.number_input("Planlagt fundamentdybde [m]", min_value=0.1, max_value=20.0, value=1.5, step=0.25)
+            gwl_risk = groundwater_risk_assessment(gwl_depth, foundation_depth_input)
+            r1, r2, r3 = st.columns(3)
+            with r1: metric_card("Grunnvannsnivå", f"{gwl_risk['grunnvannsnivå_m']:.1f} m")
+            with r2: metric_card("Fundamentdybde", f"{gwl_risk['fundamentdybde_m']:.1f} m")
+            with r3: metric_card("Margin", f"{gwl_risk['margin_m']:.2f} m")
+            color_map = {"Lav": "success", "Middels": "warning", "Høy": "error", "Kritisk": "error"}
+            getattr(st, color_map.get(gwl_risk["risikonivå"], "info"))(f"**Risiko: {gwl_risk['risikonivå']}** – {gwl_risk['merknad']}")
+
+        st.download_button("Last ned lagprofil CSV", report_df.to_csv(index=False).encode("utf-8-sig"), file_name="geoteknikk_profil.csv", mime="text/csv")
+
+    # -----------------------------------------------------------------------
+    # TAB 4 – FUNDAMENTERING OG PELING
+    # -----------------------------------------------------------------------
+    with ground_tab4:
+        st.subheader("Fundamentering og peling")
+        st.caption("Velg jordart, last og byggets areal. Appen anbefaler fundamenteringstype og estimerer kostnader.")
+
+        fa1, fa2, fa3 = st.columns(3)
+        with fa1:
+            found_soil = st.selectbox("Dominerende jordart", list(SOIL_DATABASE.keys()), key="found_soil")
+        with fa2:
+            building_area = st.number_input("Bygningens grunnflate [m²]", min_value=10.0, max_value=10000.0, value=200.0, step=10.0)
+        with fa3:
+            total_load_kN = st.number_input("Estimert total last [kN]", min_value=100.0, max_value=500000.0, value=building_area * 10.0, step=100.0,
+                                             help="Ca. 8–15 kN/m² for boligbygg, 15–25 kN/m² for næringsbygg")
+
+        rec = recommend_foundation(found_soil, building_area, total_load_kN)
+        # Lagre til rapport
+        st.session_state["rapport_jordart"] = SOIL_DATABASE[found_soil]["label"]
+        st.session_state["rapport_bæreevne"] = f"{rec['bæreevne_kPa']:.0f} kPa"
+        st.session_state["rapport_fundament_anbefalt"] = rec["label"]
+        st.session_state["rapport_bygningsareal"] = f"{building_area:,.0f} m²".replace(",", " ")
+        st.session_state["rapport_total_last"] = f"{total_load_kN:,.0f} kN".replace(",", " ")
+
+        r1, r2, r3 = st.columns(3)
+        with r1: metric_card("Anbefalt", rec["label"])
+        with r2: metric_card("Bæreevne", f"{rec['bæreevne_kPa']:.0f} kPa")
+        with r3: metric_card("Nødv. areal", f"{rec['nødvendig_areal_m2']} m²")
+        st.info(f"**Begrunnelse:** {rec['begrunnelse']}")
+
+        st.subheader("Beregn fundamentkostnad")
+        f1, f2 = st.columns(2)
+        with f1:
+            chosen_foundation = st.selectbox("Fundamenteringstype", list(FOUNDATION_DATABASE.keys()),
+                                              format_func=lambda k: FOUNDATION_DATABASE[k]["label"])
+        with f2:
+            fd_info = FOUNDATION_DATABASE[chosen_foundation]
+            found_qty = st.number_input(f"Mengde [{fd_info['unit']}]", min_value=1.0, max_value=100000.0, value=building_area, step=10.0)
+
+        found_result = calculate_foundation_cost(chosen_foundation, found_qty)
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1: metric_card("Kostnad", f"{found_result['total_kostnad_kr']:,.0f} kr".replace(",", " "))
+        with fc2: metric_card("CO₂", f"{found_result['total_co2_kgCO2e']:,.0f} kgCO₂e".replace(",", " "))
+        with fc3: metric_card("Enhetspris", f"{found_result['enhetspris_kr']:,.0f} kr/{fd_info['unit']}".replace(",", " "))
+        st.caption(fd_info["description"])
+
+        st.subheader("Pelekalkulator")
+        needs_piling = found_soil in ["Leire", "Kvikkleire", "Torv", "Silt"]
+        if needs_piling:
+            st.warning(f"Jordart **{SOIL_DATABASE[found_soil]['label']}** har lav bæreevne. Peling til fjell eller fast lag er sannsynlig.")
+
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            depth_to_rock = st.number_input("Dybde til fjell / fast lag [m]", min_value=0.5, max_value=80.0, value=8.0, step=0.5)
+        with p2:
+            n_piles = st.number_input("Antall peler", min_value=1, max_value=500, value=max(4, int(building_area / 16)), step=1)
+        with p3:
+            pile_soil = st.selectbox("Jordart rundt peler", list(SOIL_DATABASE.keys()), key="pile_soil", index=list(SOIL_DATABASE.keys()).index(found_soil))
+
+        pile_est = estimate_pile_length(depth_to_rock, pile_soil)
+        total_lm = pile_est["anbefalt_pellengde_m"] * n_piles
+        # Lagre til rapport
+        st.session_state["rapport_peler_antall"] = str(int(n_piles))
+        st.session_state["rapport_peler_lengde"] = f"{pile_est['anbefalt_pellengde_m']:.1f} m"
+        st.session_state["rapport_peler_total_lm"] = f"{total_lm:.0f} lm"
+        st.session_state["rapport_peler_kostnad_staal"] = f"{pile_est['kostnad_stålpel_kr'] * n_piles:,.0f} kr".replace(",", " ")
+        st.session_state["rapport_peler_kostnad_betong"] = f"{pile_est['kostnad_betongpel_kr'] * n_piles:,.0f} kr".replace(",", " ")
+
+        st.subheader(f"Estimat: {n_piles} peler à {pile_est['anbefalt_pellengde_m']} m = {total_lm:.0f} lm")
+        pe1, pe2, pe3, pe4 = st.columns(4)
+        with pe1: metric_card("Pellengde per pel", f"{pile_est['anbefalt_pellengde_m']:.1f} m")
+        with pe2: metric_card("Total lm peler", f"{total_lm:.0f} lm")
+        with pe3: metric_card("Kostnad stålpel", f"{pile_est['kostnad_stålpel_kr'] * n_piles:,.0f} kr".replace(",", " "))
+        with pe4: metric_card("Kostnad betongpel", f"{pile_est['kostnad_betongpel_kr'] * n_piles:,.0f} kr".replace(",", " "))
+
+        pile_df = pd.DataFrame([{
+            "Type": "Stålpel", "Antall": n_piles, "Lengde per pel [m]": pile_est["anbefalt_pellengde_m"],
+            "Total [lm]": total_lm,
+            "Kostnad [kr]": pile_est["kostnad_stålpel_kr"] * n_piles,
+            "CO₂ [kgCO2e]": pile_est["co2_stålpel_kgCO2e"] * n_piles,
+        }, {
+            "Type": "Betongpel", "Antall": n_piles, "Lengde per pel [m]": pile_est["anbefalt_pellengde_m"],
+            "Total [lm]": total_lm,
+            "Kostnad [kr]": pile_est["kostnad_betongpel_kr"] * n_piles,
+            "CO₂ [kgCO2e]": pile_est["co2_betongpel_kgCO2e"] * n_piles,
+        }])
+        st.dataframe(pile_df, use_container_width=True, hide_index=True)
+        st.download_button("Last ned fundamenteringsdata CSV", pile_df.to_csv(index=False).encode("utf-8-sig"), file_name="fundamentering.csv", mime="text/csv")
+
+    # -----------------------------------------------------------------------
+    # TAB 5 – CO₂-REGNSKAP GRUNN
+    # -----------------------------------------------------------------------
+    with ground_tab5:
+        st.subheader("CO₂-regnskap for grunnarbeider")
+        st.caption("Beregner klimagassutslipp fra utgraving, transport, fyllmasser, fundamenter og peler.")
+
+        co2_c1, co2_c2 = st.columns(2)
+        with co2_c1:
+            co2_soil = st.selectbox("Dominerende jordart (for CO₂-faktor)", list(SOIL_DATABASE.keys()), key="co2_soil")
+            co2_cut = st.number_input("Estimert utgraving [m³]", min_value=0.0, value=500.0, step=50.0)
+            co2_fill = st.number_input("Estimert oppfylling [m³]", min_value=0.0, value=200.0, step=50.0)
+        with co2_c2:
+            co2_area = st.number_input("Fundamentareal [m²]", min_value=0.0, value=200.0, step=10.0)
+            co2_pile_lm = st.number_input("Peler – totalt løpemeter [lm]", min_value=0.0, value=0.0, step=10.0)
+            co2_found_type = st.selectbox("Fundamenteringstype (CO₂)", list(FOUNDATION_DATABASE.keys()),
+                                           format_func=lambda k: FOUNDATION_DATABASE[k]["label"], key="co2_found_type")
+
+        co2_df = calculate_ground_co2(co2_cut, co2_fill, co2_area, co2_soil, co2_pile_lm, co2_found_type)
+        total_co2 = co2_df["CO₂ [kgCO2e]"].sum()
+        # Lagre til rapport
+        st.session_state["rapport_grunn_co2"] = f"{total_co2:,.0f} kgCO₂e".replace(",", " ")
+        st.session_state["rapport_grunn_co2_m2"] = f"{total_co2 / max(co2_area, 1):,.1f} kgCO₂e/m²".replace(",", " ")
+        st.session_state["rapport_grunn_cut"] = f"{co2_cut:,.1f} m³".replace(",", " ")
+        st.session_state["rapport_grunn_fill"] = f"{co2_fill:,.1f} m³".replace(",", " ")
+        st.session_state["rapport_grunn_soil"] = co2_soil
+        st.session_state["rapport_grunn_foundation"] = co2_found_type
+        st.session_state["rapport_grunn_co2_df"] = co2_df.copy()
+
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1: metric_card("Total CO₂", f"{total_co2:,.0f} kgCO₂e".replace(",", " "))
+        with tc2: metric_card("CO₂ per m²", f"{total_co2 / max(co2_area, 1):,.1f} kgCO₭e/m²".replace(",", " "))
+        with tc3: metric_card("CO₂ per m³ utgraving", f"{total_co2 / max(co2_cut, 1):,.1f} kgCO₂e/m³".replace(",", " "))
+
+        st.dataframe(co2_df, use_container_width=True, hide_index=True)
+
+        fig_co2, ax_co2 = plt.subplots(figsize=(7, 4))
+        co2_pos = co2_df[co2_df["CO₂ [kgCO2e]"] > 0]
+        ax_co2.barh(co2_pos["Post"], co2_pos["CO₂ [kgCO2e]"], color="#1f4e79")
+        ax_co2.set_xlabel("CO₂ [kgCO2e]")
+        ax_co2.set_title("CO₂-fordeling grunnarbeider")
+        ax_co2.invert_yaxis()
+        plt.tight_layout()
+        st.pyplot(fig_co2)
+        plt.close(fig_co2)
+
+        st.download_button("Last ned CO₂-regnskap CSV", co2_df.to_csv(index=False).encode("utf-8-sig"), file_name="grunn_co2.csv", mime="text/csv")
+
 
 elif valg == "Materialbytte":
     st.header("🔁 Materialbytte")
@@ -2860,6 +3559,10 @@ elif valg == "Bygggenerator":
     geom = generate_plan_geometry(bg_params)
     frame_df = generate_frame_export_parametric(bg_params)
     slab_df = generate_slab_export(bg_params) if bg_params["dekker_aktiv"] == "JA" else pd.DataFrame()
+    # Lagre i session state slik at Rapport-siden kan bruke dem til IFC-eksport og visning
+    st.session_state["bg_params_last"] = bg_params
+    st.session_state["bg_frame_df_last"] = frame_df
+    st.session_state["bg_slab_df_last"] = slab_df
     qty_df = frame_to_quantity_dataset(frame_df, slab_df, bg_params)
     qa_df = run_project_qa(bg_params, frame_df, slab_df if not slab_df.empty else pd.DataFrame(columns=["DeckID"]))
 
@@ -2877,6 +3580,18 @@ elif valg == "Bygggenerator":
     with p_right:
         st.subheader("4. 3D-prinsippmodell")
         st.plotly_chart(plot_frame_3d(frame_df, slab_df), use_container_width=True)
+
+    # Lagre nøkkeltall til rapport-siden
+    st.session_state["rapport_bg_elementer"] = str(len(qty_df))
+    st.session_state["rapport_bg_kostnad"] = f"{pd.to_numeric(qty_df['Kostnad [kr]'], errors='coerce').fillna(0).sum():,.0f} kr".replace(",", " ")
+    st.session_state["rapport_bg_co2"] = f"{pd.to_numeric(qty_df['CO2 [kgCO2e]'], errors='coerce').fillna(0).sum():,.0f} kgCO₂e".replace(",", " ")
+    st.session_state["rapport_bg_vekt"] = f"{pd.to_numeric(qty_df['Vekt [kg]'], errors='coerce').fillna(0).sum():,.0f} kg".replace(",", " ")
+    st.session_state["rapport_bg_volum"] = f"{pd.to_numeric(qty_df['Volum [m3]'], errors='coerce').fillna(0).sum():,.2f} m³".replace(",", " ")
+    st.session_state["rapport_bg_etasjer"] = str(bg_params.get("antall_etasjer", "–"))
+    st.session_state["rapport_bg_bredde"] = str(bg_params.get("bredde_mm", "–"))
+    st.session_state["rapport_bg_lengde"] = str(bg_params.get("lengde_mm", "–"))
+    st.session_state["rapport_bg_hoyde"] = str(bg_params.get("etasjehoyde_mm", "–"))
+    st.session_state["rapport_bg_qty_df"] = qty_df.copy()
 
     st.subheader("5. Mengder, vekt, kostnad og CO₂")
     st.dataframe(qty_df, use_container_width=True, hide_index=True, height=430)
@@ -2915,50 +3630,529 @@ elif valg == "Bygggenerator":
                 st.error(f"Kunne ikke generere IFC: {e}")
 
 elif valg == "Rapport":
-    st.header("📝 Rapport og eksport")
-    summary_dict = make_report_summary_dict(filename, filtered)
-    c1, c2, c3 = st.columns(3)
-    with c1: metric_card("Elementer", f"{summary_dict['Antall elementer']:,}".replace(",", " "))
-    with c2: metric_card("Total kostnad", f"{summary_dict['Total kostnad [kr]']:,.0f} kr".replace(",", " "))
-    with c3: metric_card("Total CO₂", f"{summary_dict['Total CO2 [kgCO2e]']:,.0f} kgCO₂e".replace(",", " "))
+    import matplotlib.pyplot as plt
+    from ground_module import SOIL_DATABASE, FOUNDATION_DATABASE, recommend_foundation, estimate_pile_length
 
-    report_df = pd.DataFrame({"Parameter": list(summary_dict.keys()), "Verdi": list(summary_dict.values())})
-    st.dataframe(report_df, use_container_width=True, hide_index=True)
-    st.subheader("Materialoversikt")
-    st.dataframe(material_summary, use_container_width=True, hide_index=True)
+    ss = st.session_state
 
-    extra_sections = []
-    if excel_supports_prosjektering:
-        include_pros = st.checkbox("Ta med Prosjektering i rapporten", value=True)
-        if include_pros:
-            extra_sections += [("Prosjektering – QA", prosjekt_qa_df), ("Prosjektering – Rammeeksport", prosjekt_frame_df.head(100)), ("Prosjektering – Skalleksport", prosjekt_slab_df.head(100))]
+    # Beregn defaultverdier første gang rapporten åpnes
+    if "rapport_bg_elementer" not in ss:
+        try:
+            _def_params = {
+                "fag_x_r1": 4, "fag_y_r1": 2,
+                "faglengde_x_mm": 8000, "faglengde_y_mm": 12000,
+                "antall_etasjer": 3, "dekker_i_modell": 3,
+                "etasjehoyde_mm": 3000, "dekke_tykkelse_mm": 300,
+                "dekker_aktiv": "JA", "rektangel2_aktiv": "NEI",
+                "opening_aktiv": "NEI",
+                "bjelkemateriale": "Stål", "bjelkekvalitet": "S355",
+                "bjelkeprofil": "KFHUP 200x200x12.5",
+                "søylemateriale": "Stål", "søylekvalitet": "S355",
+                "søyleprofil": "KFHUP 200x200x12.5",
+                "dekke_materialtype": "Betong", "dekke_kvalitet": "B35",
+                "skalltype": "Platt skall",
+                "dekke_materiale": "Betong B35, t=300 mm",
+            }
+            _frame = generate_frame_export_parametric(_def_params)
+            _slab  = generate_slab_export(_def_params)
+            _qty   = frame_to_quantity_dataset(_frame, _slab, _def_params)
+            ss["bg_params_last"]       = _def_params
+            ss["bg_frame_df_last"]     = _frame
+            ss["bg_slab_df_last"]      = _slab
+            ss["rapport_bg_elementer"] = str(len(_qty))
+            ss["rapport_bg_kostnad"]   = f"{_qty['Kostnad [kr]'].sum():,.0f} kr".replace(",", " ")
+            ss["rapport_bg_co2"]       = f"{_qty['CO2 [kgCO2e]'].sum():,.0f} kgCO₂e".replace(",", " ")
+            ss["rapport_bg_vekt"]      = f"{_qty['Vekt [kg]'].sum():,.0f} kg".replace(",", " ")
+            ss["rapport_bg_volum"]     = f"{_qty['Volum [m3]'].sum():,.2f} m³".replace(",", " ")
+            ss["rapport_bg_etasjer"]   = str(_def_params["antall_etasjer"])
+            ss["rapport_bg_bredde"]    = f"{_def_params['fag_x_r1'] * _def_params['faglengde_x_mm']:,}".replace(",", " ")
+            ss["rapport_bg_lengde"]    = f"{_def_params['fag_y_r1'] * _def_params['faglengde_y_mm']:,}".replace(",", " ")
+            ss["rapport_bg_hoyde"]     = str(_def_params["etasjehoyde_mm"])
+            ss["rapport_bg_qty_df"]    = _qty.copy()
+        except Exception as _e:
+            st.warning(f"Kunne ikke beregne standardverdier for Bygggenerator: {_e}")
 
-    docx_bytes = build_docx_report(summary_dict, material_summary if not material_summary.empty else pd.DataFrame({"Info": ["Ingen materialdata"]}), extra_sections=extra_sections)
-    pdf_bytes = build_pdf_report(summary_dict, material_summary if not material_summary.empty else pd.DataFrame({"Info": ["Ingen materialdata"]}), extra_sections=extra_sections)
+    if "rapport_jordart" not in ss:
+        try:
+            _def_soil    = "Leire"
+            _def_area    = 200.0
+            _def_load    = 2000.0
+            _def_rec     = recommend_foundation(_def_soil, _def_area, _def_load)
+            _def_pile    = estimate_pile_length(8.0, _def_soil)
+            _def_n_piles = max(4, int(_def_area / 16))
+            ss["rapport_jordart"]              = SOIL_DATABASE[_def_soil]["label"]
+            ss["rapport_bæreevne"]             = f"{_def_rec['bæreevne_kPa']:.0f} kPa"
+            ss["rapport_fundament_anbefalt"]   = _def_rec["label"]
+            ss["rapport_bygningsareal"]        = f"{_def_area:,.0f} m²".replace(",", " ")
+            ss["rapport_total_last"]           = f"{_def_load:,.0f} kN".replace(",", " ")
+            ss["rapport_peler_antall"]         = str(_def_n_piles)
+            ss["rapport_peler_lengde"]         = f"{_def_pile['anbefalt_pellengde_m']:.1f} m"
+            ss["rapport_peler_total_lm"]       = f"{_def_pile['anbefalt_pellengde_m'] * _def_n_piles:.0f} lm"
+            ss["rapport_peler_kostnad_staal"]  = f"{_def_pile['kostnad_stålpel_kr'] * _def_n_piles:,.0f} kr".replace(",", " ")
+            ss["rapport_peler_kostnad_betong"] = f"{_def_pile['kostnad_betongpel_kr'] * _def_n_piles:,.0f} kr".replace(",", " ")
+        except Exception as _e:
+            st.warning(f"Kunne ikke beregne standardverdier for Grunn: {_e}")
 
-    ca, cb = st.columns(2)
-    with ca:
-        if docx_bytes is not None:
-            st.download_button("Last ned rapport som Word", data=docx_bytes, file_name="byggtotal_rapport.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        else:
-            st.info("Word-eksport er ikke tilgjengelig i dette miljøet.")
-    with cb:
-        if pdf_bytes is not None:
-            st.download_button("Last ned rapport som PDF", data=pdf_bytes, file_name="byggtotal_rapport.pdf", mime="application/pdf")
-        else:
-            st.info("PDF-eksport er ikke tilgjengelig i dette miljøet.")
+    # -----------------------------------------------------------------------
+    # DEMO-DATA – vises når ingen ekte data finnes
+    # -----------------------------------------------------------------------
+    DEMO_BG = {
+        "rapport_bg_elementer": "42",
+        "rapport_bg_kostnad":   "4 280 000 kr",
+        "rapport_bg_co2":       "185 400 kgCO₂e",
+        "rapport_bg_vekt":      "312 000 kg",
+        "rapport_bg_volum":     "128.50 m³",
+        "rapport_bg_etasjer":   "4",
+        "rapport_bg_bredde":    "12 000",
+        "rapport_bg_lengde":    "18 000",
+        "rapport_bg_hoyde":     "3 000",
+        "rapport_bg_qty_df":    pd.DataFrame({
+            "Type": ["Søyle", "Bjelke", "Dekke", "Søyle", "Bjelke"],
+            "materiale": ["Stål", "Stål", "Betong", "Limtre", "Limtre"],
+            "Antall": [12, 18, 4, 8, 10],
+            "Lengde_m": [12.0, 54.0, 0.0, 9.6, 30.0],
+            "Volum_m3": [0.42, 1.08, 86.4, 0.55, 0.90],
+            "Vekt_kg": [3294, 8478, 207360, 253, 414],
+            "Kostnad_kr": [154818, 398466, 3456000, 15400, 25200],
+            "CO2_kgCO2e": [2405, 6189, 176220, 55, 99],
+        }),
+    }
+    DEMO_GRUNN = {
+        "rapport_tomteareal":        "1 250.0 m²",
+        "rapport_prosjektkote":      "12.50 m",
+        "rapport_utgraving":         "875.0 m³",
+        "rapport_oppfylling":        "320.0 m³",
+        "rapport_antall_punkt":      "156",
+        "rapport_jordart":           "Leire",
+        "rapport_bæreevne":          "40 kPa",
+        "rapport_fundament_anbefalt":"Pelefundament – stål H-pile",
+        "rapport_bygningsareal":     "200 m²",
+        "rapport_total_last":        "2 000 kN",
+        "rapport_peler_antall":      "16",
+        "rapport_peler_lengde":      "10.0 m",
+        "rapport_peler_total_lm":    "160 lm",
+        "rapport_peler_kostnad_staal":"192 000 kr",
+        "rapport_peler_kostnad_betong":"156 800 kr",
+        "rapport_grunn_co2":         "24 650 kgCO₂e",
+        "rapport_grunn_co2_m2":      "123.3 kgCO₂e/m²",
+        "rapport_grunn_soil":        "Leire",
+        "rapport_grunn_foundation":  "Pelefundament_staal",
+        "rapport_grunn_co2_df": pd.DataFrame({
+            "Post": ["Utgraving", "Bortkjøring", "Importert fyllmasse", "Forsterkningslag", "Peler (stål)"],
+            "Enhet": ["m3","m3","m3","m3","lm"],
+            "Mengde": [875, 875, 320, 60, 160],
+            "CO₂-faktor": [2.5, 5.5, 8.0, 15.0, 28.0],
+            "CO₂ [kgCO2e]": [2187.5, 4812.5, 2560.0, 900.0, 4480.0],
+        }),
+    }
+
+    has_bg    = "rapport_bg_elementer" in ss
+    has_grunn = "rapport_jordart" in ss
+
+    # -----------------------------------------------------------------------
+    # TOPPLINJE
+    # -----------------------------------------------------------------------
+    st.header("📝 Prosjektrapport")
+    head_col, demo_col = st.columns([3, 1])
+    with head_col:
+        st.caption("Rapporten viser gjeldende verdier fra Bygggenerator og Grunn og oppdateres automatisk ved endringer.")
+    with demo_col:
+        show_demo = st.toggle("Vis demorapport", value=False, key="rapport_demo_toggle")
+
+    if show_demo:
+        data_bg    = DEMO_BG
+        data_grunn = DEMO_GRUNN
+        st.info("📋 Demorapport – eksempeldata. Slå av for å se prosjektets egne verdier.")
+    else:
+        data_bg    = ss
+        data_grunn = ss
+
+    st.divider()
+
+    # -----------------------------------------------------------------------
+    # INNHOLDSVELGER
+    # -----------------------------------------------------------------------
+    with st.expander("⚙️ Velg innhold i rapporten", expanded=not (has_bg or has_grunn or show_demo)):
+        st.markdown("**Slå av/på seksjoner:**")
+        ic1, ic2, ic3, ic4 = st.columns(4)
+        with ic1:
+            show_bg_hoved   = st.checkbox("Bygggenerator – nøkkeltall",  value=True,  key="rpt_bg_hoved")
+            show_bg_tabell  = st.checkbox("Bygggenerator – mengdetabell", value=True,  key="rpt_bg_tabell")
+        with ic2:
+            show_terreng    = st.checkbox("Grunn – terreng/stikningsdata", value=True, key="rpt_terreng")
+            show_geoteknikk = st.checkbox("Grunn – geoteknikk/fundament", value=True,  key="rpt_geoteknikk")
+        with ic3:
+            show_peler      = st.checkbox("Grunn – peler",                value=True,  key="rpt_peler")
+            show_co2_grunn  = st.checkbox("Grunn – CO₂-regnskap",         value=True,  key="rpt_co2_grunn")
+        with ic4:
+            show_co2_sum    = st.checkbox("Sammenstilt CO₂-diagram",      value=True,  key="rpt_co2_sum")
+            show_eksport    = st.checkbox("Eksport og IFC",               value=True,  key="rpt_eksport")
+
+    # -----------------------------------------------------------------------
+    # BYGGGENERATOR – NØKKELTALL
+    # -----------------------------------------------------------------------
+    if show_bg_hoved:
+        st.subheader("🏗️ Bygggenerator")
+        b1, b2, b3, b4, b5 = st.columns(5)
+        with b1: metric_card("Elementer",   data_bg.get("rapport_bg_elementer", "–"))
+        with b2: metric_card("Kostnad",     data_bg.get("rapport_bg_kostnad",   "–"))
+        with b3: metric_card("CO₂",         data_bg.get("rapport_bg_co2",       "–"))
+        with b4: metric_card("Vekt",        data_bg.get("rapport_bg_vekt",      "–"))
+        with b5: metric_card("Volum",       data_bg.get("rapport_bg_volum",     "–"))
+
+        p1, p2, p3, p4 = st.columns(4)
+        with p1: metric_card("Etasjer",         data_bg.get("rapport_bg_etasjer", "–"))
+        with p2: metric_card("Bredde [mm]",     data_bg.get("rapport_bg_bredde",  "–"))
+        with p3: metric_card("Lengde [mm]",     data_bg.get("rapport_bg_lengde",  "–"))
+        with p4: metric_card("Etasjehøyde [mm]",data_bg.get("rapport_bg_hoyde",  "–"))
+
+    if show_bg_tabell:
+        with st.expander("📋 Mengdetabell – Bygggenerator", expanded=show_bg_hoved):
+            qty_r = data_bg.get("rapport_bg_qty_df", pd.DataFrame())
+            if not qty_r.empty:
+                agg_cols = {c: "sum" for c in ["Antall","Lengde_m","Volum_m3","Vekt_kg","Kostnad_kr","CO2_kgCO2e"] if c in qty_r.columns}
+                if agg_cols:
+                    group_cols = [c for c in ["Type","materiale"] if c in qty_r.columns]
+                    if group_cols:
+                        sum_r = qty_r.groupby(group_cols, dropna=False).agg(agg_cols).reset_index()
+                        st.dataframe(sum_r, use_container_width=True, hide_index=True)
+                    else:
+                        st.dataframe(qty_r, use_container_width=True, hide_index=True)
+                else:
+                    st.dataframe(qty_r, use_container_width=True, hide_index=True)
+            else:
+                st.info("Ingen mengdedata tilgjengelig.")
+
+    if show_bg_hoved or show_bg_tabell:
+        st.divider()
+
+    # -----------------------------------------------------------------------
+    # GRUNNFORHOLD
+    # -----------------------------------------------------------------------
+    any_grunn_shown = show_terreng or show_geoteknikk or show_peler or show_co2_grunn
+    if any_grunn_shown:
+        st.subheader("🌍 Grunnforhold")
+
+    if show_terreng:
+        st.markdown("**Terreng og stikningsdata**")
+        t1, t2, t3, t4, t5 = st.columns(5)
+        with t1: metric_card("Tomteareal",   data_grunn.get("rapport_tomteareal",   "–"))
+        with t2: metric_card("Prosjektkote", data_grunn.get("rapport_prosjektkote", "–"))
+        with t3: metric_card("Utgraving",    data_grunn.get("rapport_utgraving",    "–"))
+        with t4: metric_card("Oppfylling",   data_grunn.get("rapport_oppfylling",   "–"))
+        with t5: metric_card("Stikningspunkt", data_grunn.get("rapport_antall_punkt","–"))
+
+    if show_geoteknikk:
+        st.markdown("**Geoteknikk og fundamentering**")
+        g1, g2, g3, g4, g5 = st.columns(5)
+        with g1: metric_card("Jordart",            data_grunn.get("rapport_jordart",           "–"))
+        with g2: metric_card("Bæreevne",           data_grunn.get("rapport_bæreevne",          "–"))
+        with g3: metric_card("Anbefalt fundament", data_grunn.get("rapport_fundament_anbefalt","–"))
+        with g4: metric_card("Bygningsareal",      data_grunn.get("rapport_bygningsareal",     "–"))
+        with g5: metric_card("Total last",         data_grunn.get("rapport_total_last",        "–"))
+
+    if show_peler and data_grunn.get("rapport_peler_antall", "0") not in ("0", "–", ""):
+        st.markdown("**Peler**")
+        pe1, pe2, pe3, pe4, pe5 = st.columns(5)
+        with pe1: metric_card("Antall peler",     data_grunn.get("rapport_peler_antall",          "–"))
+        with pe2: metric_card("Pellengde",         data_grunn.get("rapport_peler_lengde",          "–"))
+        with pe3: metric_card("Totalt løpemeter",  data_grunn.get("rapport_peler_total_lm",        "–"))
+        with pe4: metric_card("Kostnad stålpel",   data_grunn.get("rapport_peler_kostnad_staal",   "–"))
+        with pe5: metric_card("Kostnad betongpel", data_grunn.get("rapport_peler_kostnad_betong",  "–"))
+
+    if show_co2_grunn:
+        st.markdown("**CO₂ – grunnarbeider**")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: metric_card("Total CO₂ grunn",  data_grunn.get("rapport_grunn_co2",      "–"))
+        with c2: metric_card("CO₂ per m²",        data_grunn.get("rapport_grunn_co2_m2",   "–"))
+        with c3: metric_card("Jordart (CO₂)",     data_grunn.get("rapport_grunn_soil",     "–"))
+        with c4: metric_card("Fundamenttype",      data_grunn.get("rapport_grunn_foundation","–"))
+
+        with st.expander("📋 Detaljert CO₂-regnskap grunn", expanded=False):
+            co2_df_r = data_grunn.get("rapport_grunn_co2_df", pd.DataFrame())
+            if not co2_df_r.empty:
+                st.dataframe(co2_df_r, use_container_width=True, hide_index=True)
+
+    if any_grunn_shown:
+        st.divider()
+
+    # -----------------------------------------------------------------------
+    # SAMMENSTILT CO₂
+    # -----------------------------------------------------------------------
+    if show_co2_sum:
+        st.subheader("🌿 Sammenstilt CO₂-oversikt")
+
+        def _parse_co2(val_str):
+            try:
+                return float(str(val_str).replace(" ", "").replace("kgCO₂e", "").replace(",", ".").split("k")[0])
+            except Exception:
+                return 0.0
+
+        co2_bg_val  = _parse_co2(data_bg.get("rapport_bg_co2",    "0"))
+        co2_gr_val  = _parse_co2(data_grunn.get("rapport_grunn_co2", "0"))
+        co2_total   = co2_bg_val + co2_gr_val
+
+        cs1, cs2, cs3 = st.columns(3)
+        with cs1: metric_card("CO₂ konstruksjon",  f"{co2_bg_val:,.0f} kgCO₂e".replace(",", " "))
+        with cs2: metric_card("CO₂ grunnarbeider", f"{co2_gr_val:,.0f} kgCO₂e".replace(",", " "))
+        with cs3: metric_card("Total CO₂ prosjekt",f"{co2_total:,.0f} kgCO₂e".replace(",", " "))
+
+        if co2_total > 0:
+            fig_s, ax_s = plt.subplots(figsize=(5, 3))
+            labels = []; values = []; colors = []
+            if co2_bg_val > 0:
+                labels.append("Konstruksjon"); values.append(co2_bg_val); colors.append("#1f4e79")
+            if co2_gr_val > 0:
+                labels.append("Grunnarbeider"); values.append(co2_gr_val); colors.append("#2e7d32")
+            bars = ax_s.bar(labels, values, color=colors, edgecolor="#333", linewidth=0.5)
+            ax_s.set_ylabel("kgCO₂e")
+            ax_s.set_title("CO₂-fordeling")
+            for bar, val in zip(bars, values):
+                ax_s.text(bar.get_x() + bar.get_width() / 2,
+                          bar.get_height() + co2_total * 0.01,
+                          f"{val:,.0f}".replace(",", " "),
+                          ha="center", va="bottom", fontsize=9)
+            plt.tight_layout()
+            st.pyplot(fig_s)
+            plt.close(fig_s)
+
+        st.divider()
+
+    # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # BYGNINGSPLASSERING PÅ TOMT
+    # -----------------------------------------------------------------------
+    show_plassering = st.session_state.get("rpt_plassering", True)
+    with st.expander("⚙️ Velg innhold i rapporten", expanded=False):
+        pass  # already rendered above – this block handled by checkbox
+
+    st.divider()
+    st.subheader("📍 Plassering av bygg på tomt")
+    st.caption("Flytt bygget manuelt på tomten. Koordinatene brukes ved IFC-eksport.")
+
+    # Hent byggets dimensjoner fra session state
+    _bg_p = ss.get("bg_params_last", {})
+    _bx = safe_num(_bg_p.get("fag_x_r1", 4)) * safe_num(_bg_p.get("faglengde_x_mm", 8000)) / 1000.0
+    _by = safe_num(_bg_p.get("fag_y_r1", 2)) * safe_num(_bg_p.get("faglengde_y_mm", 12000)) / 1000.0
+    if _bx <= 0: _bx = 32.0
+    if _by <= 0: _by = 24.0
+
+    # Hent tomteareal fra session state (brukes til å sette max-grenser)
+    _tomt_str = ss.get("rapport_tomteareal", "1250")
+    try:
+        _tomt_m2 = float(str(_tomt_str).replace(" ", "").replace("m²","").replace(",",".").split("m")[0])
+    except Exception:
+        _tomt_m2 = 1250.0
+    _tomt_side = max(_tomt_m2 ** 0.5, max(_bx, _by) + 10.0)
+
+    pl1, pl2, pl3, pl4 = st.columns(4)
+    with pl1:
+        bygg_x = st.number_input(
+            "Bygg offset X [m]",
+            min_value=0.0,
+            max_value=float(_tomt_side - _bx),
+            value=float(round((_tomt_side - _bx) / 2.0, 1)),
+            step=0.5,
+            key="bygg_offset_x",
+            help="Avstand fra venstre tomtekant til venstre hjørne av bygget"
+        )
+    with pl2:
+        bygg_y = st.number_input(
+            "Bygg offset Y [m]",
+            min_value=0.0,
+            max_value=float(_tomt_side - _by),
+            value=float(round((_tomt_side - _by) / 2.0, 1)),
+            step=0.5,
+            key="bygg_offset_y",
+            help="Avstand fra nedre tomtekant til nedre hjørne av bygget"
+        )
+    with pl3:
+        bygg_rot = st.number_input(
+            "Rotasjon [grader]",
+            min_value=0.0,
+            max_value=360.0,
+            value=0.0,
+            step=5.0,
+            key="bygg_rot",
+            help="Roter bygget rundt sitt eget sentrum"
+        )
+    with pl4:
+        tomt_side_input = st.number_input(
+            "Tomtestørrelse [m] (kvadrat)",
+            min_value=max(_bx, _by) + 2.0,
+            max_value=500.0,
+            value=float(round(_tomt_side, 0)),
+            step=1.0,
+            key="tomt_side_input",
+        )
+
+    # Verdiene leses direkte fra widget-nøklene i session state (bygg_offset_x, bygg_offset_y osv.)
+    # Streamlit lagrer disse automatisk – ingen manuell tilordning nødvendig
+
+    # Vis planvisning med bygget på tomten
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    from matplotlib.patches import FancyArrowPatch
+    import math
+
+    fig_pl, ax_pl = plt.subplots(figsize=(7, 7))
+
+    # Tomt
+    tomt = plt.Polygon(
+        [(0,0),(tomt_side_input,0),(tomt_side_input,tomt_side_input),(0,tomt_side_input)],
+        closed=True, fill=True, facecolor="#e8d5a0", edgecolor="#8B7355", linewidth=2, label="Tomt"
+    )
+    ax_pl.add_patch(tomt)
+
+    # Bygg (rotert rundt sentrum)
+    cx = bygg_x + _bx / 2.0
+    cy = bygg_y + _by / 2.0
+    angle_rad = math.radians(bygg_rot)
+    corners_local = [(-_bx/2, -_by/2), (_bx/2, -_by/2), (_bx/2, _by/2), (-_bx/2, _by/2)]
+    def rotate(px, py, a):
+        return (px*math.cos(a) - py*math.sin(a), px*math.sin(a) + py*math.cos(a))
+    corners_world = [(cx + rotate(lx, ly, angle_rad)[0], cy + rotate(lx, ly, angle_rad)[1]) for lx, ly in corners_local]
+    bygg_patch = plt.Polygon(corners_world, closed=True, fill=True,
+                              facecolor="#1f4e79", edgecolor="#0d2b45",
+                              linewidth=2, alpha=0.85, label=f"Bygg ({_bx:.0f}×{_by:.0f} m)")
+    ax_pl.add_patch(bygg_patch)
+
+    # Sentrum-markør
+    ax_pl.plot(cx, cy, "w+", markersize=10, markeredgewidth=2)
+
+    # Nord-pil
+    ax_pl.annotate("N", xy=(tomt_side_input * 0.95, tomt_side_input * 0.92),
+                    fontsize=12, fontweight="bold", color="#333", ha="center")
+    ax_pl.annotate("", xy=(tomt_side_input * 0.95, tomt_side_input * 0.98),
+                    xytext=(tomt_side_input * 0.95, tomt_side_input * 0.88),
+                    arrowprops=dict(arrowstyle="->", color="#333", lw=1.5))
+
+    # Kotekanter med mål
+    ax_pl.annotate("", xy=(_bx + bygg_x if bygg_rot == 0 else cx + _bx/2, bygg_y - 1.5 if bygg_rot == 0 else cy - _by/2 - 1.5),
+                    xytext=(bygg_x if bygg_rot == 0 else cx - _bx/2, bygg_y - 1.5 if bygg_rot == 0 else cy - _by/2 - 1.5),
+                    arrowprops=dict(arrowstyle="<->", color="#555", lw=1))
+
+    ax_pl.set_xlim(-1, tomt_side_input + 1)
+    ax_pl.set_ylim(-1, tomt_side_input + 1)
+    ax_pl.set_aspect("equal")
+    ax_pl.set_xlabel("X [m]")
+    ax_pl.set_ylabel("Y [m]")
+    ax_pl.set_title(f"Bygningsplassering på tomt  |  Bygg: {_bx:.0f}x{_by:.0f} m  |  Offset: ({bygg_x:.1f}, {bygg_y:.1f}) m  |  Rot: {bygg_rot:.0f} grader")
+    ax_pl.grid(True, alpha=0.3, linestyle="--")
+    ax_pl.legend(loc="lower right", fontsize=9)
+
+    # Dimensjonslinjer
+    if bygg_rot == 0:
+        ax_pl.annotate(f"{_bx:.0f} m", xy=(cx, bygg_y - 2.5), ha="center", fontsize=9, color="#333")
+        ax_pl.annotate(f"{_by:.0f} m", xy=(bygg_x - 2.5, cy), ha="center", fontsize=9, color="#333", rotation=90)
+
+    pl_col1, pl_col2 = st.columns([2, 1])
+    with pl_col1:
+        st.pyplot(fig_pl)
+        plt.close(fig_pl)
+    with pl_col2:
+        st.markdown("**Plasseringsinfo**")
+        metric_card("Bygg X-bredde", f"{_bx:.1f} m")
+        metric_card("Bygg Y-dybde", f"{_by:.1f} m")
+        metric_card("Senter X", f"{cx:.1f} m")
+        metric_card("Senter Y", f"{cy:.1f} m")
+        metric_card("Rotasjon", f"{bygg_rot:.0f}°")
+        metric_card("Tomteside", f"{tomt_side_input:.0f} m")
+        st.info("💡 Plasseringen brukes automatisk ved IFC-eksport under.")
+
+    st.divider()
+
+    # EKSPORT
+    # -----------------------------------------------------------------------
+    if show_eksport:
+        st.subheader("📥 Eksport")
+        ex1, ex2, ex3 = st.columns(3)
+
+        with ex1:
+            st.markdown("**Word / PDF**")
+            if not data.empty:
+                summary_dict = make_report_summary_dict(filename, data)
+                mat_r = material_summary if not material_summary.empty else pd.DataFrame({"Info": ["Ingen materialdata"]})
+                docx_bytes = build_docx_report(summary_dict, mat_r)
+                pdf_bytes  = build_pdf_report(summary_dict, mat_r)
+                if docx_bytes:
+                    st.download_button("📄 Word-rapport", data=docx_bytes,
+                                       file_name="byggtotal_rapport.docx",
+                                       mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                if pdf_bytes:
+                    st.download_button("📄 PDF-rapport", data=pdf_bytes,
+                                       file_name="byggtotal_rapport.pdf", mime="application/pdf")
+            else:
+                st.info("Generer et bygg for Word/PDF-eksport.")
+
+        with ex2:
+            st.markdown("**CSV**")
+            bg_qty_r = data_bg.get("rapport_bg_qty_df", pd.DataFrame())
+            if not bg_qty_r.empty:
+                st.download_button("📊 Mengder CSV", data=bg_qty_r.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name="byggtotal_mengder.csv", mime="text/csv")
+            co2_gr_r = data_grunn.get("rapport_grunn_co2_df", pd.DataFrame())
+            if not co2_gr_r.empty:
+                st.download_button("📊 CO₂ grunn CSV", data=co2_gr_r.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name="byggtotal_co2_grunn.csv", mime="text/csv")
+
+        with ex3:
+            st.markdown("**IFC – komplett modell**")
+            if ifcopenshell is None:
+                st.warning("`ifcopenshell` mangler.")
+            else:
+                ifc_n = st.number_input("Jordlag i IFC", min_value=0, max_value=6, value=2, step=1, key="ifc_n_r2")
+                ifc_layers_r = []
+                for li in range(int(ifc_n)):
+                    sc, st2 = st.columns(2)
+                    with sc:
+                        s_type = st.selectbox(f"Lag {li+1} type", list(SOIL_DATABASE.keys()), key=f"ifc_soil_r2_{li}")
+                    with st2:
+                        s_thk = st.number_input(f"Tykkelse [m]", min_value=0.1, value=3.0, step=0.5, key=f"ifc_thk_r2_{li}")
+                    ifc_layers_r.append({"soil_type": s_type, "thickness_m": s_thk})
+
+                ifc_gwl_r2      = st.number_input("GVN dybde [m]", min_value=0.0, value=2.5, step=0.5, key="ifc_gwl_r2")
+                ifc_found_r2    = st.selectbox("Fundamenttype", list(FOUNDATION_DATABASE.keys()),
+                                               format_func=lambda k: FOUNDATION_DATABASE[k]["label"], key="ifc_found_r2")
+                ifc_area_r2     = st.number_input("Fundamentareal [m²]", min_value=0.0, value=200.0, step=10.0, key="ifc_area_r2")
+                ifc_npiles_r2   = st.number_input("Antall peler", min_value=0, max_value=200, value=0, step=1, key="ifc_np_r2")
+                ifc_plen_r2     = st.number_input("Pellengde [m]", min_value=0.0, value=8.0, step=0.5, key="ifc_pl_r2")
+
+                if st.button("🏗️ Generer komplett IFC", type="primary", key="btn_ifc_r2"):
+                    try:
+                        def _safe_area(s):
+                            try:
+                                return float(str(s).replace(" ","").replace("m²","").replace(",","."))
+                            except Exception:
+                                return 500.0
+                        # Hent bygningsplassering direkte fra widget-nøklene
+                        _off_x   = ss.get("bygg_offset_x", 0.0)
+                        _off_y   = ss.get("bygg_offset_y", 0.0)
+                        _rot_deg = ss.get("bygg_rot", 0.0)
+
+                        with st.spinner("Genererer IFC med bygningsplassering ..."):
+                            ifc_out = generate_complete_ifc_bytes(
+                                frame_df           = ss.get("bg_frame_df_last", pd.DataFrame()),
+                                slab_df            = ss.get("bg_slab_df_last",  pd.DataFrame()),
+                                params             = ss.get("bg_params_last",   {}),
+                                ground_layers      = ifc_layers_r or None,
+                                gwl_depth_m        = ifc_gwl_r2,
+                                foundation_key     = ifc_found_r2,
+                                foundation_area_m2 = ifc_area_r2,
+                                n_piles            = int(ifc_npiles_r2),
+                                pile_length_m      = ifc_plen_r2,
+                                pile_lm            = ifc_npiles_r2 * ifc_plen_r2,
+                                site_area_m2       = ss.get("tomt_side_input", 35.0) ** 2,
+                                building_offset_x  = _off_x,
+                                building_offset_y  = _off_y,
+                                building_rotation_deg = _rot_deg,
+                            )
+                        st.success(f"Ferdig! ({len(ifc_out)//1024} kB)  |  Offset: ({_off_x:.1f}, {_off_y:.1f}) m, {_rot_deg:.0f} grader")
+                        st.download_button("⬇️ Last ned IFC", data=ifc_out,
+                                           file_name="byggtotal_komplett.ifc",
+                                           mime="application/octet-stream", key="dl_ifc_r2")
+                    except Exception as e:
+                        st.error(f"Feil ved IFC-generering: {e}")
 
 st.markdown("---")
 st.markdown("**byggTotal**")
-
-
-if "deck_variant_key" not in st.session_state:
-    st.session_state["deck_variant_key"] = "Hulldekke"
-if "concrete_variant_key" not in st.session_state:
-    st.session_state["concrete_variant_key"] = "Plasstøpt_betong"
-if "wall_variant_key" not in st.session_state:
-    st.session_state["wall_variant_key"] = "Betong_vegg"
-if "breeam_target_level" not in st.session_state:
-    st.session_state["breeam_target_level"] = "Ingen"
-if "breeam_active" not in st.session_state:
-    st.session_state["breeam_active"] = False
