@@ -356,43 +356,6 @@ def get_breeam_config(level: str) -> dict:
     return config
 
 
-def build_breeam_recommendation_table(level: str) -> pd.DataFrame:
-    cfg = get_breeam_config(level)
-    rows = [
-        {"Område": "Dekker", "Foreslått valg": MATERIAL_DATABASE.get(cfg.get("deck_variant"), {}).get("label", cfg.get("deck_variant")), "Kommentar": "Settes automatisk når scenario aktiveres."},
-        {"Område": "Plasstøpt betong", "Foreslått valg": MATERIAL_DATABASE.get(cfg.get("concrete_variant"), {}).get("label", cfg.get("concrete_variant")), "Kommentar": "Lavkarbonvariant prioriteres fra Good og oppover."},
-        {"Område": "Betongvegger", "Foreslått valg": MATERIAL_DATABASE.get(cfg.get("wall_variant"), {}).get("label", cfg.get("wall_variant")), "Kommentar": "Veggscenario justeres ved aktivert BREEAM."},
-        {"Område": "Grunnarbeider", "Foreslått valg": f"+{cfg.get('ground_multiplier',1.0)-1:.0%} miljøpåslag / +{cfg.get('reuse_bonus',0.0):.0%} masserebruk", "Kommentar": "Påslag dekker dokumentasjon, logistikk og miljøtiltak."},
-        {"Område": "Overvann", "Foreslått valg": f"{cfg.get('stormwater_rate',0.0):.0f} kr/m²", "Kommentar": "Aktiveres ved høyere BREEAM-nivåer."},
-    ]
-    return pd.DataFrame(rows)
-
-
-def build_breeam_summary_for_dataset(df: pd.DataFrame, level: str) -> tuple[pd.DataFrame, dict]:
-    cfg = get_breeam_config(level)
-    if df is None or df.empty:
-        empty = pd.DataFrame(columns=["Type", "Antall", "Kostnad nå", "Kostnad scenario", "CO2 nå", "CO2 scenario"])
-        metrics = {"cost_now": 0.0, "cost_new": 0.0, "co2_now": 0.0, "co2_new": 0.0}
-        return empty, metrics
-    scenario_df = df.copy()
-    scenario_df["Kostnad scenario [kr]"] = scenario_df.apply(lambda row: cost_for_row(row, cfg["deck_variant"], cfg["concrete_variant"], cfg["wall_variant"]), axis=1)
-    scenario_df["CO2 scenario [kgCO2e]"] = scenario_df.apply(lambda row: co2_for_row(row, cfg["deck_variant"], cfg["concrete_variant"], cfg["wall_variant"], use_epd=True), axis=1)
-    summary = scenario_df.groupby("Type", dropna=False).agg(
-        Antall=("Segment", "count"),
-        **{
-            "Kostnad nå": ("Kostnad [kr]", "sum"),
-            "Kostnad scenario": ("Kostnad scenario [kr]", "sum"),
-            "CO2 nå": ("CO2 [kgCO2e]", "sum"),
-            "CO2 scenario": ("CO2 scenario [kgCO2e]", "sum"),
-        }
-    ).reset_index()
-    metrics = {
-        "cost_now": float(scenario_df["Kostnad [kr]"].sum()),
-        "cost_new": float(scenario_df["Kostnad scenario [kr]"].sum()),
-        "co2_now": float(scenario_df["CO2 [kgCO2e]"].sum()),
-        "co2_new": float(scenario_df["CO2 scenario [kgCO2e]"].sum()),
-    }
-    return summary, metrics
 
 
 def build_ground_pricing_basis_v2(summary: dict, system_key: str = "Standard byggegrop", breeam_level: str = "Ingen") -> pd.DataFrame:
@@ -1380,60 +1343,9 @@ def export_ifc_material_swap(ifc_bytes: bytes, source_df: pd.DataFrame, selected
 # PROSJEKTERINGSMODUL
 # -------------------------
 
-def load_workbook_values(file_bytes: bytes):
-    if openpyxl is None:
-        raise ImportError("openpyxl er ikke installert.")
-    return openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-
-
-def read_cell(ws, cell, default=None):
-    try:
-        value = ws[cell].value
-        return default if value is None else value
-    except Exception:
-        return default
-
-
 def safe_bool_ja_nei(value) -> str:
     text = str(value or "").strip().upper()
     return "JA" if text == "JA" else "NEI"
-
-
-def load_project_parameters_from_excel(file_bytes: bytes) -> dict:
-    wb = load_workbook_values(file_bytes)
-    if "GEOMETRI" not in wb.sheetnames or "FORSIDE" not in wb.sheetnames:
-        raise ValueError("Excel-filen mangler FORSIDE og/eller GEOMETRI.")
-    wsf = wb["FORSIDE"]
-    wsg = wb["GEOMETRI"]
-
-    params = {
-        "bjelkemateriale": read_cell(wsf, "B3", "Stål"),
-        "søylemateriale": read_cell(wsf, "B4", "Limtre"),
-        "antall_fag_x_r1": safe_num(read_cell(wsf, "B5", read_cell(wsg, "B4", 1))),
-        "antall_fag_y_r1": safe_num(read_cell(wsf, "B8", read_cell(wsg, "B5", 1))),
-        "antall_etasjer": safe_num(read_cell(wsf, "F8", read_cell(wsg, "B36", 1))),
-        "rektangel2_aktiv": safe_bool_ja_nei(read_cell(wsg, "B2", "NEI")),
-        "fag_x_r1": safe_num(read_cell(wsg, "B4", 1)),
-        "fag_y_r1": safe_num(read_cell(wsg, "B5", 1)),
-        "faglengde_x_mm": safe_num(read_cell(wsg, "B6", 12000)),
-        "faglengde_y_mm": safe_num(read_cell(wsg, "B7", 16000)),
-        "fag_x_r2": safe_num(read_cell(wsg, "B10", 0)),
-        "fag_y_r2": safe_num(read_cell(wsg, "B11", 0)),
-        "r2_offset_x_fag": safe_num(read_cell(wsg, "B16", 0)),
-        "r2_offset_y_fag": safe_num(read_cell(wsg, "B17", 0)),
-        "dekker_aktiv": safe_bool_ja_nei(read_cell(wsg, "B26", "JA")),
-        "skalltype": read_cell(wsg, "B28", "Platt skall"),
-        "dekke_tykkelse_mm": safe_num(read_cell(wsg, "B29", 300)),
-        "dekker_i_modell": safe_num(read_cell(wsg, "B36", 1)),
-        "dekke_materiale": read_cell(wsg, "B37", "B35, Betong"),
-        "opening_width_fag": safe_num(read_cell(wsg, "B41", 0)),
-        "opening_height_fag": safe_num(read_cell(wsg, "B42", 0)),
-        "opening_offset_x_fag": safe_num(read_cell(wsg, "B43", 0)),
-        "opening_offset_y_fag": safe_num(read_cell(wsg, "B44", 0)),
-        "aktivt_dekkeareal_excel_m2": safe_num(read_cell(wsg, "B52", 0)),
-        "eksportprinsipp": read_cell(wsg, "B57", ""),
-    }
-    return params
 
 
 def generate_plan_geometry(params: dict) -> dict:
@@ -1514,50 +1426,6 @@ def rectangle_inside(rect, outer):
         and rect["x"] + rect["width"] <= outer["x"] + outer["width"]
         and rect["y"] + rect["height"] <= outer["y"] + outer["height"]
     )
-
-
-def generate_frame_export(params: dict) -> pd.DataFrame:
-    geom = generate_plan_geometry(params)
-    dx = geom["dx"]
-    dy = geom["dy"]
-    fx = max(int(round(safe_num(params.get("fag_x_r1", 1)))), 1)
-    fy = max(int(round(safe_num(params.get("fag_y_r1", 1)))), 1)
-    etasjeh = 4.0
-    n_levels = max(int(round(safe_num(params.get("antall_etasjer", params.get("dekker_i_modell", 1))))), 1)
-
-    rows = []
-    col_id = 1
-    beam_id = 1
-
-    for level in range(1, n_levels + 1):
-        z0 = (level - 1) * etasjeh
-        z1 = level * etasjeh
-        for ix in range(fx + 1):
-            for iy in range(fy + 1):
-                x = ix * dx
-                y = iy * dy
-                rows.append({"Type": "Søyle", "ID": f"C{col_id}", "Nivå": level, "X1 [m]": x, "Y1 [m]": y, "Z1 [m]": z0, "X2 [m]": x, "Y2 [m]": y, "Z2 [m]": z1})
-                col_id += 1
-
-        # X-retning bjelker
-        for iy in range(fy + 1):
-            y = iy * dy
-            for ix in range(fx):
-                x1 = ix * dx
-                x2 = (ix + 1) * dx
-                rows.append({"Type": "Bjelke", "ID": f"B{beam_id}", "Nivå": level, "X1 [m]": x1, "Y1 [m]": y, "Z1 [m]": z1, "X2 [m]": x2, "Y2 [m]": y, "Z2 [m]": z1})
-                beam_id += 1
-
-        # Y-retning bjelker
-        for ix in range(fx + 1):
-            x = ix * dx
-            for iy in range(fy):
-                y1 = iy * dy
-                y2 = (iy + 1) * dy
-                rows.append({"Type": "Bjelke", "ID": f"B{beam_id}", "Nivå": level, "X1 [m]": x, "Y1 [m]": y1, "Z1 [m]": z1, "X2 [m]": x, "Y2 [m]": y2, "Z2 [m]": z1})
-                beam_id += 1
-
-    return pd.DataFrame(rows)
 
 
 def format_point(x, y):
@@ -1672,95 +1540,7 @@ def plot_plan_geometry(geom: dict):
     return fig
 
 
-def read_export_sheet_from_excel(file_bytes: bytes, sheet_name: str, header_row_idx: int):
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header_row_idx, engine="openpyxl")
-    return clean_dataframe(df)
-
-
-def build_docx_report(summary_dict, material_summary, extra_sections=None):
-    if Document is None:
-        return None
-    doc = Document()
-    doc.add_heading("byggTotal – Prosjektrapport", 0)
-    p = doc.add_paragraph()
-    p.add_run("Generert: ").bold = True
-    p.add_run(datetime.now().strftime("%d.%m.%Y %H:%M"))
-
-    doc.add_heading("Prosjektoversikt", level=1)
-    for k, v in summary_dict.items():
-        doc.add_paragraph(f"{k}: {v}")
-
-    doc.add_heading("Materialoversikt", level=1)
-    table = doc.add_table(rows=1, cols=len(material_summary.columns))
-    table.style = "Table Grid"
-    for i, col in enumerate(material_summary.columns):
-        table.rows[0].cells[i].text = str(col)
-    for _, row in material_summary.iterrows():
-        cells = table.add_row().cells
-        for i, val in enumerate(row):
-            cells[i].text = f"{val}" if not isinstance(val, float) else f"{val:,.2f}".replace(",", " ")
-
-    if extra_sections:
-        for title, df in extra_sections:
-            if df is None or df.empty:
-                continue
-            doc.add_heading(title, level=1)
-            t = doc.add_table(rows=1, cols=len(df.columns))
-            t.style = "Table Grid"
-            for i, col in enumerate(df.columns):
-                t.rows[0].cells[i].text = str(col)
-            for _, row in df.iterrows():
-                cells = t.add_row().cells
-                for i, val in enumerate(row):
-                    cells[i].text = f"{val}" if not isinstance(val, float) else f"{val:,.2f}".replace(",", " ")
-
-    bio = io.BytesIO()
-    doc.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
-
-
-def build_pdf_report(summary_dict, material_summary, extra_sections=None):
-    if SimpleDocTemplate is None:
-        return None
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4)
-    styles = getSampleStyleSheet()
-    elements = [Paragraph("byggTotal – Prosjektrapport", styles["Title"]), Spacer(1, 12), Paragraph(f"Generert: {datetime.now().strftime('%d.%m.%Y %H:%M')}", styles["Normal"]), Spacer(1, 12)]
-
-    summary_table_data = [["Parameter", "Verdi"]] + [[str(k), str(v)] for k, v in summary_dict.items()]
-    t1 = Table(summary_table_data, hAlign="LEFT")
-    t1.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.5, colors.grey)]))
-    elements += [Paragraph("Prosjektoversikt", styles["Heading2"]), t1, Spacer(1, 16)]
-
-    t2 = Table([list(material_summary.columns)] + material_summary.astype(str).values.tolist(), hAlign="LEFT")
-    t2.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.5, colors.grey)]))
-    elements += [Paragraph("Materialoversikt", styles["Heading2"]), t2, Spacer(1, 16)]
-
-    if extra_sections:
-        for title, df in extra_sections:
-            if df is None or df.empty:
-                continue
-            t = Table([list(df.columns)] + df.astype(str).values.tolist(), hAlign="LEFT")
-            t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f4e79")), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white), ("GRID", (0, 0), (-1, -1), 0.5, colors.grey)]))
-            elements += [Paragraph(title, styles["Heading2"]), t, Spacer(1, 16)]
-
-    doc.build(elements)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
-def make_report_summary_dict(filename, filtered_df):
-    return {
-        "Fil": filename,
-        "Antall elementer": int(len(filtered_df)),
-        "Total lengde [m]": float(pd.to_numeric(filtered_df["Lengde [m]"], errors="coerce").fillna(0).sum()),
-        "Total areal [m2]": float(pd.to_numeric(filtered_df["Areal [m2]"], errors="coerce").fillna(0).sum()),
-        "Total volum [m3]": float(pd.to_numeric(filtered_df["Volum [m3]"], errors="coerce").fillna(0).sum()),
-        "Total vekt [kg]": float(pd.to_numeric(filtered_df["Vekt [kg]"], errors="coerce").fillna(0).sum()),
-        "Total kostnad [kr]": float(pd.to_numeric(filtered_df["Kostnad [kr]"], errors="coerce").fillna(0).sum()),
-        "Total CO2 [kgCO2e]": float(pd.to_numeric(filtered_df["CO2 [kgCO2e]"], errors="coerce").fillna(0).sum()),
-    }
+from reports import build_docx_report, build_pdf_report, make_report_summary_dict
 
 
 
@@ -2566,131 +2346,219 @@ def generate_complete_ifc_bytes(
             pass
 
 
-st.markdown("""
-<div class="custom-card">
-    <div style="font-size:42px; font-weight:800; color:#1f2937;">byggTotal</div>
-    <div style="font-size:20px; font-weight:600; color:#374151; margin-top:6px;">
-        Mengde-, kalkyle-, IFC- og prosjekteringsverktøy
-    </div>
-    <div style="margin-top:10px; color:#6b7280; font-size:15px;">
-        Leser Excel og IFC, gir mengder, kostnader, CO₂, materialbytte, 3D-visning og en ny modul for prosjektering.
-    </div>
-</div>
-""", unsafe_allow_html=True)
 
-st.sidebar.title("byggTotal")
-valg = st.sidebar.radio(
-    "Velg side",
-    ["3D-modell", "Bygggenerator", "Grunn", "Materialbytte", "Rapport"],
-)
+def _nav_to(page):
+    st.session_state["_page"] = page
+    st.rerun()
 
-with st.sidebar:
-    st.header("Fil og innstillinger")
-    uploaded_excel = st.file_uploader("Last opp Excel-fil (.xlsx)", type=["xlsx"])
-    uploaded_ifc = st.file_uploader("Last opp IFC-fil (.ifc)", type=["ifc"])
+if "_nav" in st.session_state:
+    st.session_state["_page"] = st.session_state.pop("_nav")
 
-    st.subheader("Produktvalg fra prisbok")
-    deck_variant = st.selectbox("Dekkeløsning", ["Hulldekke", "Hulldekke_lavCO2"], key="deck_variant_key", format_func=lambda x: MATERIAL_DATABASE[x]["label"])
-    concrete_variant = st.selectbox("Plasstøpt betong", ["Plasstøpt_betong", "Plasstøpt_betong_lavCO2"], key="concrete_variant_key", format_func=lambda x: MATERIAL_DATABASE[x]["label"])
-    wall_variant = st.selectbox("Betongvegg", ["Betong_vegg", "Betong_vegg_lavCO2"], key="wall_variant_key", format_func=lambda x: MATERIAL_DATABASE[x]["label"])
+valg = st.session_state.get("_page", "Hjem")
 
-    st.subheader("Materialegenskaper")
-    glulam_density = st.number_input("Tetthet limtre (kg/m³)", min_value=100.0, value=460.0, step=10.0)
-    clt_density = st.number_input("Tetthet massivtre / CLT (kg/m³)", min_value=100.0, value=500.0, step=10.0)
+# Alle innstillinger leses fra session state med standardverdier
+st.session_state.setdefault("deck_variant_key",     "Hulldekke")
+st.session_state.setdefault("concrete_variant_key", "Plasstøpt_betong")
+st.session_state.setdefault("wall_variant_key",     "Betong_vegg")
+st.session_state.setdefault("_glulam_density",      460.0)
+st.session_state.setdefault("_clt_density",         500.0)
+st.session_state.setdefault("_use_epd",             True)
+st.session_state.setdefault("_show_raw",            False)
+st.session_state.setdefault("_fast_mode",           True)
+st.session_state.setdefault("_use_geom_fallback",   False)
+st.session_state.setdefault("_profile_limit",       float(MAX_PROFILE_OPTIONS_DEFAULT))
+st.session_state.setdefault("_lazy_3d",             True)
 
-    st.subheader("CO₂-kilde")
-    use_epd = st.toggle("Bruk EPD-/prosjektfaktorer som primær CO₂-kilde", value=True)
+deck_variant          = st.session_state["deck_variant_key"]
+concrete_variant      = st.session_state["concrete_variant_key"]
+wall_variant          = st.session_state["wall_variant_key"]
+glulam_density        = st.session_state["_glulam_density"]
+clt_density           = st.session_state["_clt_density"]
+use_epd               = st.session_state["_use_epd"]
+show_raw              = st.session_state["_show_raw"]
+fast_mode             = st.session_state["_fast_mode"]
+use_geometry_fallback = st.session_state["_use_geom_fallback"]
+profile_option_limit  = st.session_state["_profile_limit"]
+lazy_load_3d          = st.session_state["_lazy_3d"]
 
-    st.subheader("Visning")
-    show_raw = st.toggle("Vis rådata", value=False)
-
-    st.subheader("Ytelse")
-    fast_mode = st.toggle("Rask modus for IFC", value=True, help="Hopper over tunge geometriestimater ved IFC-innlasting.")
-    use_geometry_fallback = st.toggle("Bruk geometriestimat ved manglende IFC-mengder", value=False, help="Kan gi mer komplette mengder, men gjør IFC-innlasting tregere.")
-    profile_option_limit = st.number_input("Maks profiler i filter", min_value=20, max_value=500, value=MAX_PROFILE_OPTIONS_DEFAULT, step=10, help="Begrenser hvor mange unike profiler som lastes inn i filteret.")
-    lazy_load_3d = st.toggle("Last 3D først når jeg klikker", value=True)
+uploaded_ifc   = None
+uploaded_excel = None
 
 GLULAM_DENSITY = glulam_density
-CLT_DENSITY = clt_density
-MATERIAL_DATABASE["Limtre"]["density"] = glulam_density
-MATERIAL_DATABASE["Massivtre"]["density"] = clt_density
+CLT_DENSITY    = clt_density
+MATERIAL_DATABASE["Limtre"]["density"]       = glulam_density
+MATERIAL_DATABASE["Massivtre"]["density"]    = clt_density
 MATERIAL_DATABASE["Massivtre_vegg"]["density"] = clt_density
+
+if valg == "Hjem":
+    st.markdown("""
+    <style>
+    .bt-hero {
+        background: #1f4e79;
+        border-radius: 16px;
+        padding: 2.8rem 2.5rem 2.2rem;
+        margin-bottom: 2rem;
+    }
+    .bt-hero-title { font-size: 2.8rem; font-weight: 600; color: #e6f1fb; margin: 0 0 0.3rem; letter-spacing: -1px; }
+    .bt-hero-sub   { font-size: 1.1rem; color: #b5d4f4; margin: 0 0 1.2rem; }
+    .bt-badge { display: inline-block; background: rgba(255,255,255,0.13); border: 0.5px solid rgba(255,255,255,0.22); border-radius: 20px; padding: 3px 13px; font-size: 0.8rem; color: #b5d4f4; margin-right: 6px; }
+    .bt-navcard {
+        background: var(--color-background-primary);
+        border: 0.5px solid var(--color-border-tertiary);
+        border-radius: 14px;
+        padding: 1.3rem 1.2rem 0.6rem;
+        height: 100%;
+    }
+    .bt-navcard-icon { font-size: 2rem; margin-bottom: 0.5rem; }
+    .bt-navcard-title { font-size: 1rem; font-weight: 600; color: var(--color-text-primary); margin: 0 0 0.4rem; }
+    .bt-navcard-desc { font-size: 0.84rem; color: var(--color-text-secondary); line-height: 1.55; margin: 0 0 0.9rem; }
+    .bt-step-row { display: flex; gap: 10px; align-items: flex-start; padding: 0.55rem 0; border-bottom: 0.5px solid var(--color-border-tertiary); }
+    .bt-step-num { background: #e6f1fb; color: #0c447c; border-radius: 50%; width: 22px; height: 22px; display:flex; align-items:center; justify-content:center; font-size: 0.75rem; font-weight: 600; flex-shrink: 0; margin-top: 2px; }
+    .bt-step-text { font-size: 0.88rem; color: var(--color-text-primary); line-height: 1.5; }
+    .bt-step-text b { color: #0c447c; font-weight: 500; }
+    </style>
+
+    <div class="bt-hero">
+        <div class="bt-hero-title">byggTotal</div>
+        <div class="bt-hero-sub">Komplett verktøy for mengdeuttak, kostnad, CO₂ og grunnarbeider</div>
+        <span class="bt-badge">Norsk Prisbok 2024</span>
+        <span class="bt-badge">NS3420</span>
+        <span class="bt-badge">IFC / BIM</span>
+        <span class="bt-badge">EPD-faktorer</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("#### Velg verktøy")
+    _r1c1, _r1c2, _r1c3 = st.columns(3)
+    _r2c1, _r2c2, _r2c3 = st.columns(3)
+
+    with _r1c1:
+        st.markdown('<div class="bt-navcard"><div class="bt-navcard-icon">📊</div><div class="bt-navcard-title">Mengder</div><div class="bt-navcard-desc">Automatisk mengdeuttak fra Excel eller IFC med kostnad og CO₂ per element, type og materiale.</div></div>', unsafe_allow_html=True)
+        if st.button("Åpne Mengder", key="nav_mengder", use_container_width=True):
+            _nav_to("Mengder")
+
+    with _r1c2:
+        st.markdown('<div class="bt-navcard"><div class="bt-navcard-icon">🏗️</div><div class="bt-navcard-title">Bygggenerator</div><div class="bt-navcard-desc">Generer et parametrisk bygg fra scratch — definer etasjer, fagverk og materialer, eksporter til IFC.</div></div>', unsafe_allow_html=True)
+        if st.button("Åpne Bygggenerator", key="nav_bg", use_container_width=True):
+            _nav_to("Bygggenerator")
+
+    with _r1c3:
+        st.markdown('<div class="bt-navcard"><div class="bt-navcard-icon">🌍</div><div class="bt-navcard-title">Grunn</div><div class="bt-navcard-desc">Terrenganalyse, geoteknikk, fundamentering og peling med CO₂-regnskap og stikningsdata-import.</div></div>', unsafe_allow_html=True)
+        if st.button("Åpne Grunn", key="nav_grunn", use_container_width=True):
+            _nav_to("Grunn")
+
+    st.markdown("")
+
+    with _r2c1:
+        st.markdown('<div class="bt-navcard"><div class="bt-navcard-icon">🔁</div><div class="bt-navcard-title">Materialbytte</div><div class="bt-navcard-desc">Sammenlign kostnad og CO₂-konsekvens ved materialbytte direkte i modellen, med IFC-eksport.</div></div>', unsafe_allow_html=True)
+        if st.button("Åpne Materialbytte", key="nav_mb", use_container_width=True):
+            _nav_to("Materialbytte")
+
+    with _r2c2:
+        st.markdown('<div class="bt-navcard"><div class="bt-navcard-icon">🧊</div><div class="bt-navcard-title">3D-modell</div><div class="bt-navcard-desc">Interaktiv 3D-visning av IFC-modellen i nettleseren. Filtrer og fremhev elementer fritt.</div></div>', unsafe_allow_html=True)
+        if st.button("Åpne 3D-modell", key="nav_3d", use_container_width=True):
+            _nav_to("3D-modell")
+
+    with _r2c3:
+        st.markdown('<div class="bt-navcard"><div class="bt-navcard-icon">📝</div><div class="bt-navcard-title">Rapport</div><div class="bt-navcard-desc">Komplett prosjektrapport med alle nøkkeltall fra konstruksjon og grunnarbeider. Word eller PDF.</div></div>', unsafe_allow_html=True)
+        if st.button("Åpne Rapport", key="nav_rapport", use_container_width=True):
+            _nav_to("Rapport")
+
+    st.markdown("")
+    _r3c1, _r3c2, _r3c3 = st.columns(3)
+    with _r3c1:
+        st.markdown('<div class="bt-navcard"><div class="bt-navcard-icon">⚙️</div><div class="bt-navcard-title">Innstillinger</div><div class="bt-navcard-desc">Juster materialtetthet, CO₂-kilde, ytelsesalternativer og standardprodukter fra Norsk Prisbok.</div></div>', unsafe_allow_html=True)
+        if st.button("Åpne Innstillinger", key="nav_innstillinger", use_container_width=True):
+            _nav_to("Innstillinger")
+
+    st.markdown("---")
+
+    _qs1, _qs2 = st.columns([1.2, 1])
+    with _qs1:
+        st.markdown("#### Last opp prosjektfil")
+        _hjem_file = st.file_uploader(
+            "Dra inn Excel- eller IFC-fil her",
+            type=["xlsx", "ifc"],
+            label_visibility="collapsed",
+            help="Støtter Excel (.xlsx) og IFC (.ifc)",
+        )
+        if _hjem_file is not None:
+            _bytes = _hjem_file.getvalue()
+            st.session_state["_filename"] = _hjem_file.name
+            if _hjem_file.name.lower().endswith(".ifc"):
+                st.session_state["_ifc_bytes"]   = _bytes
+                st.session_state["_excel_bytes"] = None
+            else:
+                st.session_state["_excel_bytes"] = _bytes
+                st.session_state["_ifc_bytes"]   = None
+            _nav_to("Mengder")
+
+        _active_fname = st.session_state.get("_filename")
+        if _active_fname:
+            st.success(f"Aktiv fil: **{_active_fname}**")
+            _hjem_c1, _hjem_c2 = st.columns(2)
+            with _hjem_c1:
+                if st.button("→ Gå til Mengder", type="primary", use_container_width=True):
+                    _nav_to("Mengder")
+            with _hjem_c2:
+                if st.button("🗑️ Fjern fil", use_container_width=True):
+                    for _k in ["_filename", "_ifc_bytes", "_excel_bytes"]:
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+        else:
+            st.caption("Støtter Excel (.xlsx) og IFC (.ifc). Eller start med Bygggenerator uten fil.")
+
+    with _qs2:
+        st.markdown("#### Kom i gang")
+        st.markdown("""
+        <div class="bt-step-row"><div class="bt-step-num">1</div><div class="bt-step-text">Last opp en <b>Excel</b>- eller <b>IFC</b>-fil til venstre</div></div>
+        <div class="bt-step-row"><div class="bt-step-num">2</div><div class="bt-step-text">Klikk <b>Mengder</b> for mengdeuttak, kostnad og CO₂-oversikt</div></div>
+        <div class="bt-step-row"><div class="bt-step-num">3</div><div class="bt-step-text">Bruk <b>Materialbytte</b> for å sammenligne materialalternativer</div></div>
+        <div class="bt-step-row"><div class="bt-step-num">4</div><div class="bt-step-text">Analyser grunnforhold i <b>Grunn</b></div></div>
+        <div class="bt-step-row" style="border-bottom:none"><div class="bt-step-num">5</div><div class="bt-step-text">Last ned <b>Rapport</b> som Word eller PDF</div></div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.caption("byggTotal · Norsk Prisbok 2024 · EPD-faktorer · NS3420 · IFC/BIM")
+    st.stop()
 
 data = None
 nodes = pd.DataFrame()
 forside = pd.DataFrame()
-filename = None
-excel_supports_prosjektering = False
-project_params = {}
-prosjekt_frame_df = pd.DataFrame()
-prosjekt_slab_df = pd.DataFrame()
-prosjekt_qa_df = pd.DataFrame()
-excel_export_frame_df = pd.DataFrame()
-excel_export_slab_df = pd.DataFrame()
-excel_qa_df = pd.DataFrame()
-ifc_bytes = None
-excel_bytes = None
+ifc_bytes   = st.session_state.get("_ifc_bytes")
+excel_bytes = st.session_state.get("_excel_bytes")
+filename    = st.session_state.get("_filename")
 
 try:
-    if uploaded_ifc is not None:
-        filename = uploaded_ifc.name
-        ifc_bytes = uploaded_ifc.getvalue()
+    if ifc_bytes is not None:
         with st.spinner("Behandler IFC-fil..."):
             data, nodes, forside = build_dataset_from_ifc(
                 ifc_bytes,
                 use_geometry_fallback=use_geometry_fallback,
                 fast_mode=fast_mode,
             )
-    elif uploaded_excel is not None:
-        filename = uploaded_excel.name
-        excel_bytes = uploaded_excel.getvalue()
+    elif excel_bytes is not None:
         try:
             data, nodes, forside = build_dataset_from_excel(excel_bytes)
         except Exception:
-            # Tillat Prosjektering selv om MENGDER/Segmenter/Knutepunkter mangler
             data = pd.DataFrame(columns=["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "materiale", "Endret IFC", "Mengdegrunnlag"])
             nodes = pd.DataFrame()
             forside = pd.DataFrame()
-        try:
-            project_params = load_project_parameters_from_excel(excel_bytes)
-            prosjekt_frame_df = generate_frame_export(project_params)
-            prosjekt_slab_df = generate_slab_export(project_params)
-            prosjekt_qa_df = run_project_qa(project_params, prosjekt_frame_df, prosjekt_slab_df)
-            excel_supports_prosjektering = True
-            try:
-                excel_export_frame_df = read_export_sheet_from_excel(excel_bytes, "EXPORT_RAMME", 2)
-            except Exception:
-                excel_export_frame_df = pd.DataFrame()
-            try:
-                excel_export_slab_df = read_export_sheet_from_excel(excel_bytes, "EXPORT_FOCUS", 9)
-            except Exception:
-                excel_export_slab_df = pd.DataFrame()
-            try:
-                excel_qa_df = read_export_sheet_from_excel(excel_bytes, "QA_IFC_kontroll", 2)
-            except Exception:
-                excel_qa_df = pd.DataFrame()
-        except Exception:
-            excel_supports_prosjektering = False
     else:
+        _empty_cols_base = ["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "materiale", "Endret IFC", "Mengdegrunnlag"]
         if valg == "Bygggenerator":
             filename = "Generert bygg"
-            data = pd.DataFrame(columns=["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "materiale", "Materialkvalitet", "Endret IFC", "Mengdegrunnlag", "Kostnad [kr]", "CO2 [kgCO2e]"])
-            nodes = pd.DataFrame()
-            forside = pd.DataFrame()
-        elif valg in ["Grunn", "Rapport"]:
-            # Disse modulene krever ingen Excel/IFC-fil
-            filename = "Ingen fil lastet"
-            data = pd.DataFrame(columns=["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "materiale", "Endret IFC", "Mengdegrunnlag"])
-            nodes = pd.DataFrame()
-            forside = pd.DataFrame()
+            data = pd.DataFrame(columns=_empty_cols_base + ["Materialkvalitet", "Kostnad [kr]", "CO2 [kgCO2e]"])
         else:
-            st.info("Last opp en Excel-fil eller IFC-fil i sidepanelet for å starte analysen, eller velg Bygggenerator for å starte uten fil.")
-            st.stop()
+            filename = filename or "Ingen fil lastet"
+            data = pd.DataFrame(columns=_empty_cols_base)
+        nodes = pd.DataFrame()
+        forside = pd.DataFrame()
 except Exception as e:
     st.error(f"Kunne ikke lese filen: {e}")
     st.stop()
 
-if filename and filename != "Ingen fil lastet":
+if filename and filename not in ("Ingen fil lastet", "Generert bygg"):
     st.success(f"Aktiv fil: **{filename}**")
 
 for col in ["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "materiale", "Endret IFC", "Mengdegrunnlag"]:
@@ -2713,27 +2581,33 @@ if not forside.empty:
         if len(row) >= 2 and pd.notna(row.iloc[0]) and pd.notna(row.iloc[1]):
             param[str(row.iloc[0]).strip()] = row.iloc[1]
 
-with st.container():
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        type_options = sorted([x for x in data["Type"].dropna().astype(str).unique().tolist()]) if not data.empty else []
-        selected_types = st.multiselect("Type", type_options, default=type_options)
-    with c2:
-        mat_options = sorted([x for x in data["materiale"].dropna().astype(str).unique().tolist()]) if not data.empty else []
-        selected_materials = st.multiselect("Materiale", mat_options, default=mat_options)
-    with c3:
-        all_profile_options = sorted([x for x in data["Material / Tverrsnitt"].dropna().astype(str).unique().tolist()]) if not data.empty else []
-        profile_options = all_profile_options[:int(profile_option_limit)]
-        selected_profiles = st.multiselect("Profil / tverrsnitt", profile_options, default=profile_options[:8] if len(profile_options) > 8 else profile_options, help=f"Viser de første {int(profile_option_limit)} unike profilene for raskere lasting.")
-    with c4:
-        length_series = pd.to_numeric(data.get("Lengde [m]", pd.Series(dtype=float)), errors="coerce")
-        length_series = length_series[(length_series.notna()) & (length_series >= 0)]
-        reasonable_lengths = length_series[length_series <= 1000]
-        slider_source = reasonable_lengths if not reasonable_lengths.empty else length_series
-        max_length = float(slider_source.max() or 0) if not slider_source.empty else 0.0
-        length_range = st.slider("Lengdeintervall [m]", 0.0, max(1.0, max_length), (0.0, max(1.0, max_length)))
+type_options = sorted([x for x in data["Type"].dropna().astype(str).unique().tolist()]) if not data.empty else []
+mat_options = sorted([x for x in data["materiale"].dropna().astype(str).unique().tolist()]) if not data.empty else []
+all_profile_options = sorted([x for x in data["Material / Tverrsnitt"].dropna().astype(str).unique().tolist()]) if not data.empty else []
+profile_options = all_profile_options[:int(profile_option_limit)]
+length_series = pd.to_numeric(data.get("Lengde [m]", pd.Series(dtype=float)), errors="coerce")
+length_series = length_series[(length_series.notna()) & (length_series >= 0)]
+reasonable_lengths = length_series[length_series <= 1000]
+slider_source = reasonable_lengths if not reasonable_lengths.empty else length_series
+max_length = float(slider_source.max() or 0) if not slider_source.empty else 0.0
 
-st.caption("Tips: Profilfilteret viser nå alle profiler som standard, og lengdeslideren ignorerer urimelig store verdier når maksgrensen settes.")
+if valg in ["Mengder", "Materialbytte"]:
+    with st.container():
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            selected_types = st.multiselect("Type", type_options, default=type_options)
+        with c2:
+            selected_materials = st.multiselect("Materiale", mat_options, default=mat_options)
+        with c3:
+            selected_profiles = st.multiselect("Profil / tverrsnitt", profile_options, default=profile_options[:8] if len(profile_options) > 8 else profile_options, help=f"Viser de første {int(profile_option_limit)} unike profilene for raskere lasting.")
+        with c4:
+            length_range = st.slider("Lengdeintervall [m]", 0.0, max(1.0, max_length), (0.0, max(1.0, max_length)))
+    st.caption("Tips: Profilfilteret viser nå alle profiler som standard, og lengdeslideren ignorerer urimelig store verdier når maksgrensen settes.")
+else:
+    selected_types = type_options
+    selected_materials = mat_options
+    selected_profiles = profile_options
+    length_range = (0.0, max(1.0, max_length))
 
 filtered = data.copy()
 if not filtered.empty:
@@ -2767,7 +2641,28 @@ material_summary = (
 swap_df = pd.DataFrame()
 
 if valg == "Mengder":
+    if st.button("← Hjem", key="hjem_mengder"): _nav_to("Hjem")
     st.header("📊 Mengder")
+    with st.expander("🛒 Produktvalg fra Norsk Prisbok", expanded=False):
+        _mc1, _mc2, _mc3 = st.columns(3)
+        with _mc1:
+            _dv2 = st.selectbox("Dekkeløsning", ["Hulldekke","Hulldekke_lavCO2"],
+                index=["Hulldekke","Hulldekke_lavCO2"].index(st.session_state["deck_variant_key"]),
+                format_func=lambda x: MATERIAL_DATABASE[x]["label"], key="deck_mengder")
+            if _dv2 != st.session_state["deck_variant_key"]:
+                st.session_state["deck_variant_key"] = _dv2; st.rerun()
+        with _mc2:
+            _cv2 = st.selectbox("Plasstøpt betong", ["Plasstøpt_betong","Plasstøpt_betong_lavCO2"],
+                index=["Plasstøpt_betong","Plasstøpt_betong_lavCO2"].index(st.session_state["concrete_variant_key"]),
+                format_func=lambda x: MATERIAL_DATABASE[x]["label"], key="concrete_mengder")
+            if _cv2 != st.session_state["concrete_variant_key"]:
+                st.session_state["concrete_variant_key"] = _cv2; st.rerun()
+        with _mc3:
+            _wv2 = st.selectbox("Betongvegg", ["Betong_vegg","Betong_vegg_lavCO2"],
+                index=["Betong_vegg","Betong_vegg_lavCO2"].index(st.session_state["wall_variant_key"]),
+                format_func=lambda x: MATERIAL_DATABASE[x]["label"], key="wall_mengder")
+            if _wv2 != st.session_state["wall_variant_key"]:
+                st.session_state["wall_variant_key"] = _wv2; st.rerun()
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     with k1:
         metric_card("Elementer", f"{len(filtered):,}".replace(",", " "))
@@ -2797,27 +2692,28 @@ if valg == "Mengder":
         st.dataframe(profiles, use_container_width=True, hide_index=True)
 
     with right:
-        st.subheader("Kostnadsfordeling")
+        st.subheader("Kostnad og CO₂ per produkt")
         pie_data = summary[summary["kostnad_kr"] > 0].copy() if not summary.empty else pd.DataFrame()
-        if not pie_data.empty:
-            pie_data["navn"] = pie_data["Type"].fillna("Ukjent") + " – " + pie_data["materiale"].fillna("Ukjent")
-            fig1, ax1 = plt.subplots(figsize=(6, 5))
-            ax1.pie(pie_data["kostnad_kr"], labels=pie_data["navn"], autopct="%1.1f%%", startangle=90)
-            ax1.axis("equal")
-            st.pyplot(fig1)
-        else:
-            st.info("Ingen kostnadsdata er tilgjengelige for valgt utvalg.")
-
-        st.subheader("CO₂ per produkt")
         co2_data = filtered.groupby("Produktnavn", dropna=False)["CO2 [kgCO2e]"].sum().reset_index() if not filtered.empty else pd.DataFrame()
         co2_data = co2_data[co2_data["CO2 [kgCO2e]"] > 0] if not co2_data.empty else co2_data
-        if not co2_data.empty:
-            fig2, ax2 = plt.subplots(figsize=(6, 4))
-            ax2.bar(co2_data["Produktnavn"].fillna("Ukjent"), co2_data["CO2 [kgCO2e]"])
-            plt.xticks(rotation=25, ha="right")
-            st.pyplot(fig2)
+
+        if not pie_data.empty or not co2_data.empty:
+            import plotly.subplots as ps
+            fig_combo = ps.make_subplots(
+                rows=1, cols=2,
+                specs=[[{"type": "pie"}, {"type": "bar"}]],
+                subplot_titles=["Kostnadsfordeling", "CO₂ per produkt"],
+            )
+            if not pie_data.empty:
+                pie_data["navn"] = pie_data["Type"].fillna("Ukjent") + " – " + pie_data["materiale"].fillna("Ukjent")
+                fig_combo.add_trace(go.Pie(labels=pie_data["navn"], values=pie_data["kostnad_kr"], textinfo="percent", hovertemplate="%{label}<br>%{value:,.0f} kr<extra></extra>"), row=1, col=1)
+            if not co2_data.empty:
+                fig_combo.add_trace(go.Bar(x=co2_data["Produktnavn"].fillna("Ukjent"), y=co2_data["CO2 [kgCO2e]"], marker_color="#2ecc71", hovertemplate="%{x}<br>%{y:,.0f} kgCO₂e<extra></extra>"), row=1, col=2)
+            fig_combo.update_layout(height=420, showlegend=False, margin=dict(t=40, b=10, l=10, r=10))
+            fig_combo.update_xaxes(tickangle=-30, row=1, col=2)
+            st.plotly_chart(fig_combo, use_container_width=True)
         else:
-            st.info("Ingen CO₂-data er tilgjengelige for valgt utvalg.")
+            st.info("Ingen data er tilgjengelige for valgt utvalg.")
 
     show_cols = [c for c in ["Segment", "Type", "Knutepunkter", "Material / Tverrsnitt", "materiale", "Produktnøkkel", "Produktnavn", "NS3420-kode", "Mengdegrunnlag", "Endret IFC", "Lengde [m]", "Areal [m2]", "Volum [m3]", "Vekt [kg]", "Kostnad [kr]", "CO2 [kgCO2e]", "IFC Type", "IFC GlobalId"] if c in filtered.columns]
     st.subheader("Filtrerte elementer")
@@ -2836,6 +2732,7 @@ elif valg == "Grunn":
         build_ground_report_df,
     )
 
+    if st.button("← Hjem", key="hjem_grunn"): _nav_to("Hjem")
     st.header("🌍 Grunn og georeferering")
     active_breeam_level = st.session_state.get("breeam_target_level", "Ingen") if st.session_state.get("breeam_active", False) else "Ingen"
 
@@ -2951,9 +2848,9 @@ elif valg == "Grunn":
     # -----------------------------------------------------------------------
     with ground_tab2:
         st.subheader("Georeferering – importer punktdata")
-        st.caption("Støtter GeoJSON, DXF (AutoCAD) og WMS/WFS-lenker fra f.eks. Geonorge.")
+        st.caption("Støtter GeoJSON, DXF (AutoCAD) og stikningsdata (CSV/Excel).")
 
-        geo_format = st.radio("Velg format", ["GeoJSON", "DXF (AutoCAD)", "WMS/WFS-URL", "Stikningsdata (CSV/Excel)"], horizontal=True)
+        geo_format = st.radio("Velg format", ["GeoJSON", "DXF (AutoCAD)", "Stikningsdata (CSV/Excel)"], horizontal=True)
 
         geo_df = pd.DataFrame()
         geo_meta = {}
@@ -2979,16 +2876,6 @@ elif valg == "Grunn":
                     st.warning("DXF-støtte krever pakken `ezdxf`. Legg til `ezdxf` i requirements.txt og installer på nytt med `py -m pip install ezdxf`.")
                 except Exception as e:
                     st.error(f"Feil ved lesing av DXF: {e}")
-
-        elif geo_format == "WMS/WFS-URL":
-            st.info("Lim inn en WMS/WFS-URL fra f.eks. Geonorge (https://www.geonorge.no/kart/)")
-            wms_url = st.text_input("WMS/WFS-URL", placeholder="https://wms.geonorge.no/skwms1/wms.fjell?SERVICE=WMS&...")
-            if wms_url:
-                info = parse_wms_bbox_from_url(wms_url) if wms_url else {}
-                if info:
-                    st.markdown("**Parsede parametere fra URL:**")
-                    st.json(info)
-                st.info("WMS/WFS gir kartvisning, ikke direkte punktdata. Eksporter punkter fra Geonorge som GeoJSON eller CSV og last opp her.")
 
         elif geo_format == "Stikningsdata (CSV/Excel)":
             stake_geo_file = st.file_uploader("Last opp stikningsdata", type=["csv", "xlsx", "xls", "txt", "pts"], key="geo_stake")
@@ -3216,6 +3103,7 @@ elif valg == "Grunn":
 
 
 elif valg == "Materialbytte":
+    if st.button("← Hjem", key="hjem_mb"): _nav_to("Hjem")
     st.header("🔁 Materialbytte")
     if data.empty:
         st.info("Materialbytte krever mengde- eller IFC-data i datasettet.")
@@ -3246,7 +3134,25 @@ elif valg == "Materialbytte":
             with m1: metric_card("Antall elementer", f"{len(swap_df):,}".replace(",", " "))
             with m2: metric_card("Gammel kostnad", f"{swap_df['Gammel kostnad [kr]'].sum():,.0f} kr".replace(",", " "))
             with m3: metric_card("Ny kostnad", f"{swap_df['Ny kostnad [kr]'].sum():,.0f} kr".replace(",", " "))
-            with m4: metric_card("Kostnadsendring", f"{swap_df['Kostnadsendring [kr]'].sum():,.0f} kr".replace(",", " "))
+            _kost_delta = swap_df['Kostnadsendring [kr]'].sum()
+            with m4: metric_card("Kostnadsendring", f"{_kost_delta:,.0f} kr".replace(",", " "))
+
+            _co2_old = swap_df["Gammel CO₂ [kgCO2e]"].sum() if "Gammel CO₂ [kgCO2e]" in swap_df.columns else None
+            _co2_new = swap_df["Ny CO₂ [kgCO2e]"].sum() if "Ny CO₂ [kgCO2e]" in swap_df.columns else None
+            _co2_delta = (_co2_new - _co2_old) if (_co2_old is not None and _co2_new is not None) else None
+
+            _kost_color = "#d4edda" if _kost_delta <= 0 else "#f8d7da"
+            _kost_icon = "✅" if _kost_delta <= 0 else "⚠️"
+            _banner_parts = [f"{_kost_icon} Kostnadsendring: **{_kost_delta:+,.0f} kr**".replace(",", " ")]
+            if _co2_delta is not None:
+                _co2_color = "#d4edda" if _co2_delta <= 0 else "#f8d7da"
+                _co2_icon = "🌿" if _co2_delta <= 0 else "⚠️"
+                _banner_parts.append(f"{_co2_icon} CO₂-endring: **{_co2_delta:+,.0f} kgCO₂e**".replace(",", " "))
+                _banner_bg = "#d4edda" if (_kost_delta <= 0 and _co2_delta <= 0) else "#f8d7da"
+            else:
+                _banner_bg = _kost_color
+            st.markdown(f"<div style='background:{_banner_bg};padding:0.6rem 1rem;border-radius:6px;margin-bottom:0.5rem;'>{' &nbsp;|&nbsp; '.join(_banner_parts)}</div>", unsafe_allow_html=True)
+
             st.dataframe(swap_df, use_container_width=True, hide_index=True)
 
             if uploaded_ifc is not None and "IFC GlobalId" in swap_df.columns:
@@ -3270,97 +3176,8 @@ elif valg == "Materialbytte":
                     except Exception as e:
                         st.error(f"Kunne ikke generere IFC-fil: {e}")
 
-elif valg == "BREEAM":
-    st.header("🌿 BREEAM")
-    st.caption("Velg ønsket BREEAM-nivå og la appen styre anbefalte material- og grunnscenarioer. Dette er en pekepinnsmodell for tidligfase, ikke en full sertifiseringsmotor.")
-
-    current_level = st.session_state.get("breeam_target_level", "Ingen")
-    selected_level = st.select_slider("Velg BREEAM-nivå", options=BREEAM_LEVELS, value=current_level)
-    cfg = get_breeam_config(selected_level)
-
-    k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        metric_card("Målnivå", selected_level)
-    with k2:
-        metric_card("Dekkesystem", MATERIAL_DATABASE.get(cfg.get("deck_variant"), {}).get("label", cfg.get("deck_variant")))
-    with k3:
-        metric_card("Betongscenario", MATERIAL_DATABASE.get(cfg.get("concrete_variant"), {}).get("label", cfg.get("concrete_variant")))
-    with k4:
-        metric_card("Grunnpåslag", f"{(cfg.get('ground_multiplier',1.0)-1):.0%}")
-
-    b1, b2 = st.columns([1, 1.1])
-    with b1:
-        st.subheader("Scenarioeffekter")
-        for note in cfg.get("notes", []):
-            st.write(f"- {note}")
-        rec_df = build_breeam_recommendation_table(selected_level)
-        st.dataframe(rec_df, use_container_width=True, hide_index=True)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Aktiver BREEAM-scenario"):
-                st.session_state["breeam_target_level"] = selected_level
-                st.session_state["breeam_active"] = selected_level != "Ingen"
-                st.session_state["deck_variant_key"] = cfg.get("deck_variant", st.session_state.get("deck_variant_key", "Hulldekke"))
-                st.session_state["concrete_variant_key"] = cfg.get("concrete_variant", st.session_state.get("concrete_variant_key", "Plasstøpt_betong"))
-                st.session_state["wall_variant_key"] = cfg.get("wall_variant", st.session_state.get("wall_variant_key", "Betong_vegg"))
-                st.rerun()
-        with c2:
-            if st.button("Nullstill scenario"):
-                st.session_state["breeam_target_level"] = "Ingen"
-                st.session_state["breeam_active"] = False
-                st.session_state["deck_variant_key"] = "Hulldekke"
-                st.session_state["concrete_variant_key"] = "Plasstøpt_betong"
-                st.session_state["wall_variant_key"] = "Betong_vegg"
-                st.rerun()
-
-    with b2:
-        st.subheader("Effekt på dagens modell")
-        breeam_summary_df, breeam_metrics = build_breeam_summary_for_dataset(filtered if not filtered.empty else data, selected_level)
-        d1, d2, d3, d4 = st.columns(4)
-        with d1:
-            metric_card("Kostnad nå", f"{breeam_metrics['cost_now']:,.0f} kr".replace(",", " "))
-        with d2:
-            metric_card("Kostnad scenario", f"{breeam_metrics['cost_new']:,.0f} kr".replace(",", " "))
-        with d3:
-            metric_card("CO₂ nå", f"{breeam_metrics['co2_now']:,.0f} kgCO₂e".replace(",", " "))
-        with d4:
-            metric_card("CO₂ scenario", f"{breeam_metrics['co2_new']:,.0f} kgCO₂e".replace(",", " "))
-        st.dataframe(breeam_summary_df, use_container_width=True, hide_index=True)
-
-    st.info("Forslag videre for BREEAM-modulen: legg inn egne poengmotorer for energi, transport, materialer, avfall, helse/inneklima og arealbruk, og koble scenarioene til faktisk IFC-data per etasje eller bygningsdel.")
-
-elif valg == "CO₂-regnskap":
-    st.header("🌍 CO₂-regnskap")
-    total_co2 = filtered["CO2 [kgCO2e]"].sum() if not filtered.empty else 0
-    total_cost = filtered["Kostnad [kr]"].sum() if not filtered.empty else 0
-    c1, c2, c3 = st.columns(3)
-    with c1: metric_card("Totalt CO₂-avtrykk", f"{total_co2:,.0f} kgCO₂e".replace(",", " "))
-    with c2: metric_card("Estimert kostnad", f"{total_cost:,.0f} kr".replace(",", " "))
-    with c3: metric_card("CO₂ per element", f"{(total_co2 / len(filtered)) if len(filtered) > 0 else 0:,.1f}".replace(",", " "))
-
-    co2_material = (
-        filtered.groupby(["materiale", "Produktnavn", "NS3420-kode"], dropna=False)
-        .agg(antall=("Segment", "count"), areal_m2=("Areal [m2]", "sum"), volum_m3=("Volum [m3]", "sum"), vekt_kg=("Vekt [kg]", "sum"), co2_kg=("CO2 [kgCO2e]", "sum"), kostnad_kr=("Kostnad [kr]", "sum"))
-        .reset_index().sort_values("co2_kg", ascending=False)
-    ) if not filtered.empty else pd.DataFrame()
-    st.dataframe(co2_material, use_container_width=True, hide_index=True)
-
-    left, right = st.columns(2)
-    with left:
-        if not co2_material.empty:
-            fig4, ax4 = plt.subplots(figsize=(6, 4))
-            ax4.bar(co2_material["Produktnavn"].fillna("Ukjent"), co2_material["co2_kg"])
-            plt.xticks(rotation=25, ha="right")
-            st.pyplot(fig4)
-    with right:
-        if not co2_material.empty:
-            fig5, ax5 = plt.subplots(figsize=(6, 4))
-            ax5.bar(co2_material["Produktnavn"].fillna("Ukjent"), co2_material["kostnad_kr"])
-            plt.xticks(rotation=25, ha="right")
-            st.pyplot(fig5)
-
 elif valg == "3D-modell":
+    if st.button("← Hjem", key="hjem_3d"): _nav_to("Hjem")
     st.header("🧊 3D-modellvisning")
     if uploaded_ifc is None:
         st.info("3D-modellvisning er tilgjengelig når en IFC-fil er lastet opp.")
@@ -3383,103 +3200,8 @@ elif valg == "3D-modell":
         else:
             st.info("Klikk på knappen for å laste 3D-modellen.")
 
-elif valg == "Prosjektering":
-    st.header("🧩 Prosjektering")
-    if uploaded_excel is None:
-        st.info("Last opp Excel-filen med FORSIDE/GEOMETRI for å bruke prosjekteringsmodulen.")
-    elif not excel_supports_prosjektering:
-        st.warning("Excel-filen ble lest, men FORSIDE/GEOMETRI kunne ikke tolkes sikkert for prosjektering.")
-    else:
-        st.caption("Denne modulen er lagt inn som første fungerende Python-versjon av prosjekteringsmotoren. Den leser FORSIDE/GEOMETRI, gir redigerbar input, genererer planform, ramme- og dekkeeksport, samt QA-kontroll.")
-
-        st.subheader("1. Input")
-        i1, i2, i3, i4 = st.columns(4)
-        with i1:
-            project_params["fag_x_r1"] = st.number_input("Fag X R1", min_value=1, value=int(round(project_params["fag_x_r1"])), step=1)
-            project_params["faglengde_x_mm"] = st.number_input("Faglengde X [mm]", min_value=1000, value=int(round(project_params["faglengde_x_mm"])), step=100)
-            project_params["dekke_tykkelse_mm"] = st.number_input("Dekketøykkelse [mm]", min_value=1, value=int(round(project_params["dekke_tykkelse_mm"])), step=5)
-        with i2:
-            project_params["fag_y_r1"] = st.number_input("Fag Y R1", min_value=1, value=int(round(project_params["fag_y_r1"])), step=1)
-            project_params["faglengde_y_mm"] = st.number_input("Faglengde Y [mm]", min_value=1000, value=int(round(project_params["faglengde_y_mm"])), step=100)
-            project_params["dekker_i_modell"] = st.number_input("Dekker i modell", min_value=1, value=int(round(project_params["dekker_i_modell"])), step=1)
-        with i3:
-            project_params["rektangel2_aktiv"] = "JA" if st.toggle("Aktiver rektangel 2 / tilbygg", value=project_params["rektangel2_aktiv"] == "JA") else "NEI"
-            project_params["fag_x_r2"] = st.number_input("Fag X R2", min_value=0, value=int(round(project_params["fag_x_r2"])), step=1)
-            project_params["fag_y_r2"] = st.number_input("Fag Y R2", min_value=0, value=int(round(project_params["fag_y_r2"])), step=1)
-        with i4:
-            project_params["r2_offset_x_fag"] = st.number_input("R2 offset X [fag]", min_value=0, value=int(round(project_params["r2_offset_x_fag"])), step=1)
-            project_params["r2_offset_y_fag"] = st.number_input("R2 offset Y [fag]", min_value=0, value=int(round(project_params["r2_offset_y_fag"])), step=1)
-            project_params["dekker_aktiv"] = "JA" if st.toggle("Dekker aktive", value=project_params["dekker_aktiv"] == "JA") else "NEI"
-
-        j1, j2, j3, j4 = st.columns(4)
-        with j1:
-            project_params["opening_width_fag"] = st.number_input("Åpning bredde [fag]", min_value=0, value=int(round(project_params["opening_width_fag"])), step=1)
-        with j2:
-            project_params["opening_height_fag"] = st.number_input("Åpning høyde [fag]", min_value=0, value=int(round(project_params["opening_height_fag"])), step=1)
-        with j3:
-            project_params["opening_offset_x_fag"] = st.number_input("Åpning offset X [fag]", min_value=0, value=int(round(project_params["opening_offset_x_fag"])), step=1)
-        with j4:
-            project_params["opening_offset_y_fag"] = st.number_input("Åpning offset Y [fag]", min_value=0, value=int(round(project_params["opening_offset_y_fag"])), step=1)
-
-        project_params["skalltype"] = st.text_input("Skalltype", value=str(project_params["skalltype"]))
-        project_params["dekke_materiale"] = st.text_input("Dekkemateriale", value=str(project_params["dekke_materiale"]))
-        project_params["eksportprinsipp"] = st.text_input("Eksportprinsipp", value=str(project_params["eksportprinsipp"]))
-
-        geom = generate_plan_geometry(project_params)
-        prosjekt_frame_df = generate_frame_export(project_params)
-        prosjekt_slab_df = generate_slab_export(project_params)
-        prosjekt_qa_df = run_project_qa(project_params, prosjekt_frame_df, prosjekt_slab_df)
-
-        k1, k2, k3, k4 = st.columns(4)
-        with k1: metric_card("Planformkode", geom["planformkode"])
-        with k2: metric_card("Bruttoareal", f"{geom['gross_area_m2']:,.1f} m²".replace(",", " "))
-        with k3: metric_card("Åpningsareal", f"{geom['opening_area_m2']:,.1f} m²".replace(",", " "))
-        with k4: metric_card("Aktivt areal", f"{geom['active_area_m2']:,.1f} m²".replace(",", " "))
-
-        left, right = st.columns([1.05, 1])
-        with left:
-            st.subheader("2. Geometrilogikk / 2D-preview")
-            fig_plan = plot_plan_geometry(geom)
-            st.pyplot(fig_plan)
-        with right:
-            st.subheader("3. QA / kontroll")
-            st.dataframe(prosjekt_qa_df, use_container_width=True, hide_index=True)
-
-        a, b = st.columns(2)
-        with a:
-            st.subheader("4A. Generert rammeeksport (Python)")
-            st.dataframe(prosjekt_frame_df, use_container_width=True, hide_index=True, height=420)
-            st.download_button("Last ned rammeeksport CSV", prosjekt_frame_df.to_csv(index=False).encode("utf-8-sig"), file_name="export_ramme_python.csv", mime="text/csv")
-        with b:
-            st.subheader("4B. Generert dekke-/skalleksport (Python)")
-            st.dataframe(prosjekt_slab_df, use_container_width=True, hide_index=True, height=420)
-            st.download_button("Last ned skalleksport CSV", prosjekt_slab_df.to_csv(index=False).encode("utf-8-sig"), file_name="export_skall_python.csv", mime="text/csv")
-
-        with st.expander("Sammenligning mot Excel-arkets eksportfaner"):
-            s1, s2 = st.columns(2)
-            with s1:
-                st.markdown("**Excel – EXPORT_RAMME**")
-                if not excel_export_frame_df.empty:
-                    st.dataframe(excel_export_frame_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Fant ikke lesbar EXPORT_RAMME i filen.")
-            with s2:
-                st.markdown("**Excel – EXPORT_FOCUS**")
-                if not excel_export_slab_df.empty:
-                    st.dataframe(excel_export_slab_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Fant ikke lesbar EXPORT_FOCUS i filen.")
-
-        with st.expander("Innlastede prosjektparametere"):
-            params_df = pd.DataFrame({"Parameter": list(project_params.keys()), "Verdi": list(project_params.values())})
-            st.dataframe(params_df, use_container_width=True, hide_index=True)
-
-        if not excel_qa_df.empty:
-            with st.expander("Excel – QA_IFC_kontroll"):
-                st.dataframe(excel_qa_df, use_container_width=True, hide_index=True)
-
-
 elif valg == "Bygggenerator":
+    if st.button("← Hjem", key="hjem_bg"): _nav_to("Hjem")
     st.header("🏗️ Bygggenerator")
     st.caption("Generer et råbygg direkte i appen. Modulen bruker samme logikk som Excel-arket: grid/fag, etasjer, geometri, dekker og materialkvaliteter.")
 
@@ -3752,6 +3474,7 @@ elif valg == "Rapport":
     # -----------------------------------------------------------------------
     # TOPPLINJE
     # -----------------------------------------------------------------------
+    if st.button("← Hjem", key="hjem_rapport"): _nav_to("Hjem")
     st.header("📝 Prosjektrapport")
     head_col, demo_col = st.columns([3, 1])
     with head_col:
@@ -4062,6 +3785,43 @@ elif valg == "Rapport":
 
     st.divider()
 
+    # -----------------------------------------------------------------------
+    # FORHÅNDSVISNING
+    # -----------------------------------------------------------------------
+    with st.expander("👁️ Forhåndsvis rapport", expanded=False):
+        st.markdown("Dette er en forhåndsvisning av hva Word/PDF-rapporten vil inneholde.")
+        _prev_rows = []
+        if show_bg_hoved:
+            _prev_rows.append(("🏗️ Bygggenerator – nøkkeltall", [
+                f"Elementer: {data_bg.get('rapport_bg_elementer', '–')}",
+                f"Kostnad: {data_bg.get('rapport_bg_kostnad', '–')}",
+                f"CO₂: {data_bg.get('rapport_bg_co2', '–')}",
+            ]))
+        if show_terreng:
+            _prev_rows.append(("🌍 Terreng", [
+                f"Tomteareal: {data_grunn.get('rapport_tomteareal', '–')}",
+                f"Prosjektkote: {data_grunn.get('rapport_prosjektkote', '–')}",
+            ]))
+        if show_geoteknikk:
+            _prev_rows.append(("🪨 Geoteknikk", [
+                f"Jordart: {data_grunn.get('rapport_jordart', '–')}",
+                f"Anbefalt fundament: {data_grunn.get('rapport_fundament_anbefalt', '–')}",
+            ]))
+        if show_co2_grunn:
+            _prev_rows.append(("🌿 CO₂ grunn", [
+                f"Total CO₂: {data_grunn.get('rapport_grunn_co2', '–')}",
+            ]))
+        if _prev_rows:
+            for _section, _lines in _prev_rows:
+                st.markdown(f"**{_section}**")
+                for _line in _lines:
+                    st.markdown(f"- {_line}")
+                st.markdown("")
+        else:
+            st.info("Ingen data tilgjengelig ennå. Fyll inn data i Bygggenerator og Grunn-sidene.")
+
+    st.divider()
+
     # EKSPORT
     # -----------------------------------------------------------------------
     if show_eksport:
@@ -4153,6 +3913,59 @@ elif valg == "Rapport":
                                            mime="application/octet-stream", key="dl_ifc_r2")
                     except Exception as e:
                         st.error(f"Feil ved IFC-generering: {e}")
+
+elif valg == "Innstillinger":
+    if st.button("← Hjem", key="hjem_innstillinger"): _nav_to("Hjem")
+    st.header("⚙️ Innstillinger")
+    st.caption("Endringer lagres automatisk og gjelder for hele økten.")
+
+    st.subheader("Produktvalg fra Norsk Prisbok")
+    _is1, _is2, _is3 = st.columns(3)
+    with _is1:
+        _dv = st.selectbox("Dekkeløsning", ["Hulldekke", "Hulldekke_lavCO2"],
+            index=["Hulldekke","Hulldekke_lavCO2"].index(st.session_state["deck_variant_key"]),
+            format_func=lambda x: MATERIAL_DATABASE[x]["label"])
+        st.session_state["deck_variant_key"] = _dv
+    with _is2:
+        _cv = st.selectbox("Plasstøpt betong", ["Plasstøpt_betong","Plasstøpt_betong_lavCO2"],
+            index=["Plasstøpt_betong","Plasstøpt_betong_lavCO2"].index(st.session_state["concrete_variant_key"]),
+            format_func=lambda x: MATERIAL_DATABASE[x]["label"])
+        st.session_state["concrete_variant_key"] = _cv
+    with _is3:
+        _wv = st.selectbox("Betongvegg", ["Betong_vegg","Betong_vegg_lavCO2"],
+            index=["Betong_vegg","Betong_vegg_lavCO2"].index(st.session_state["wall_variant_key"]),
+            format_func=lambda x: MATERIAL_DATABASE[x]["label"])
+        st.session_state["wall_variant_key"] = _wv
+
+    st.divider()
+    st.subheader("Materialegenskaper")
+    _ma1, _ma2 = st.columns(2)
+    with _ma1:
+        st.session_state["_glulam_density"] = st.number_input("Tetthet limtre (kg/m³)", min_value=100.0, max_value=900.0, value=float(st.session_state["_glulam_density"]), step=10.0)
+    with _ma2:
+        st.session_state["_clt_density"] = st.number_input("Tetthet massivtre / CLT (kg/m³)", min_value=100.0, max_value=900.0, value=float(st.session_state["_clt_density"]), step=10.0)
+
+    st.divider()
+    st.subheader("CO₂-kilde og visning")
+    _co1, _co2 = st.columns(2)
+    with _co1:
+        st.session_state["_use_epd"] = st.toggle("Bruk EPD-/prosjektfaktorer som primær CO₂-kilde", value=st.session_state["_use_epd"])
+    with _co2:
+        st.session_state["_show_raw"] = st.toggle("Vis rådata i Mengder", value=st.session_state["_show_raw"])
+
+    st.divider()
+    st.subheader("Ytelse (IFC og 3D)")
+    _yt1, _yt2 = st.columns(2)
+    with _yt1:
+        st.session_state["_fast_mode"] = st.toggle("Rask modus for IFC", value=st.session_state["_fast_mode"], help="Hopper over tunge geometriestimater ved IFC-innlasting.")
+        st.session_state["_use_geom_fallback"] = st.toggle("Bruk geometriestimat ved manglende IFC-mengder", value=st.session_state["_use_geom_fallback"])
+    with _yt2:
+        st.session_state["_lazy_3d"] = st.toggle("Last 3D først når jeg klikker", value=st.session_state["_lazy_3d"])
+        st.session_state["_profile_limit"] = float(st.number_input("Maks profiler i filter", min_value=20, max_value=500, value=int(st.session_state["_profile_limit"]), step=10))
+
+    st.divider()
+    if st.button("← Tilbake til Hjem", use_container_width=True):
+        _nav_to("Hjem")
 
 st.markdown("---")
 st.markdown("**byggTotal**")
