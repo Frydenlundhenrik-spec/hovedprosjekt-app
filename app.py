@@ -1718,7 +1718,12 @@ def generate_frame_export_parametric(params: dict) -> pd.DataFrame:
                     y = round(y0 + iy * dy, 6)
                     ckey = (level, x, y, round(z0, 6), round(z1, 6))
                     if ckey not in seen_columns:
-                        rows.append({"Type": "Søyle", "ID": f"C{col_id}", "Nivå": level, "X1 [m]": x, "Y1 [m]": y, "Z1 [m]": z0, "X2 [m]": x, "Y2 [m]": y, "Z2 [m]": z1})
+                        _rb_bunn = "Fast innspent" if abs(z0) < 0.001 else "Ledd"
+                        rows.append({"Type": "Søyle", "ID": f"C{col_id}", "Nivå": level,
+                                     "X1 [m]": x, "Y1 [m]": y, "Z1 [m]": z0,
+                                     "X2 [m]": x, "Y2 [m]": y, "Z2 [m]": z1,
+                                     "Randbetingelse bunn": _rb_bunn,
+                                     "Randbetingelse topp": "Ledd"})
                         seen_columns.add(ckey)
                         col_id += 1
             for iy in range(fy + 1):
@@ -1936,6 +1941,234 @@ def _beam_orientation(model, x1, y1, z1, x2, y2, z2):
     return axis, ref, length
 
 
+def generate_saf_bytes(frame_df: pd.DataFrame, params: dict, project_name: str = "byggTotal",
+                       slab_df: pd.DataFrame | None = None) -> bytes:
+    """Genererer en SAF-fil (Structural Analysis Format, .xlsx) for Focus Konstruksjon.
+
+    SAF er et Excel-basert utvekslingsformat som støtter:
+    - Noder med koordinater
+    - 1D-elementer (søyler og bjelker) med tverrsnitt og materiale
+    - 2D-elementer (dekker) fast forbundet til bjelker via delte noder
+    - Punktrandbetingelser (fast innspent) ved søyle-bunnpunkter
+    """
+    import io
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+
+    # ── Hjelpefunksjon: lag header-rad ────────────────────────────────────────
+    HDR_FILL = PatternFill("solid", fgColor="1F4E79")
+    HDR_FONT = Font(color="FFFFFF", bold=True)
+
+    def _make_sheet(name: str, headers: list[str]) -> openpyxl.worksheet.worksheet.Worksheet:
+        ws = wb.create_sheet(name)
+        for col, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=col, value=h)
+            c.fill = HDR_FILL
+            c.font = HDR_FONT
+            c.alignment = Alignment(horizontal="center")
+            ws.column_dimensions[get_column_letter(col)].width = max(len(h) + 4, 14)
+        return ws
+
+    # ── 1. Project ────────────────────────────────────────────────────────────
+    ws_proj = _make_sheet("Project", ["Name", "Description", "ProjectLevel", "ModelType"])
+    ws_proj.append([project_name, "Eksportert fra byggTotal", "ProjectLevel1", "3D"])
+
+    # ── 2. Nodes – samle unike knutepunkter ──────────────────────────────────
+    node_map: dict[tuple, str] = {}
+    node_id = 1
+
+    def _node_key(x, y, z):
+        return (round(float(x), 4), round(float(y), 4), round(float(z), 4))
+
+    def _get_node(x, y, z) -> str:
+        nonlocal node_id
+        k = _node_key(x, y, z)
+        if k not in node_map:
+            node_map[k] = f"N{node_id}"
+            node_id += 1
+        return node_map[k]
+
+    # Pre-pass: registrer alle noder
+    if frame_df is not None and not frame_df.empty:
+        for _, r in frame_df.iterrows():
+            _get_node(r.get("X1 [m]", 0), r.get("Y1 [m]", 0), r.get("Z1 [m]", 0))
+            _get_node(r.get("X2 [m]", 0), r.get("Y2 [m]", 0), r.get("Z2 [m]", 0))
+
+    ws_nodes = _make_sheet("Node", ["Name", "X [m]", "Y [m]", "Z [m]"])
+    for (x, y, z), nid in sorted(node_map.items(), key=lambda kv: int(kv[1][1:])):
+        ws_nodes.append([nid, x, y, z])
+
+    # ── 3. Material ───────────────────────────────────────────────────────────
+    ws_mat = _make_sheet("Material", ["Name", "E [MPa]", "G [MPa]", "Poisson", "UnitMass [kg/m3]", "Type"])
+    mat_seen: set[str] = set()
+    _mat_props = {
+        "Stål":    (210000, 81000, 0.3, 7850, "STEEL"),
+        "Betong":  (33000,  13750, 0.2, 2400, "CONCRETE"),
+        "Limtre":  (13000,  800,   0.3, 470,  "TIMBER"),
+        "Massivtre": (12000, 750,  0.3, 500,  "TIMBER"),
+    }
+    col_mat  = params.get("søylemateriale", "Stål")
+    beam_mat = params.get("bjelkemateriale", "Stål")
+    for mat in [col_mat, beam_mat]:
+        if mat not in mat_seen:
+            mat_seen.add(mat)
+            p = _mat_props.get(mat, (210000, 81000, 0.3, 7850, "STEEL"))
+            ws_mat.append([mat, p[0], p[1], p[2], p[3], p[4]])
+
+    # ── 4. Cross section ──────────────────────────────────────────────────────
+    ws_cs = _make_sheet("CrossSection", ["Name", "Material", "Type", "Parameters"])
+    col_prof  = params.get("søyleprofil",  "HEB 200")
+    beam_prof = params.get("bjelkeprofil", "IPE 300")
+    cs_seen: set[str] = set()
+    for prof, mat in [(col_prof, col_mat), (beam_prof, beam_mat)]:
+        cs_key = f"{mat}_{prof}"
+        if cs_key not in cs_seen:
+            cs_seen.add(cs_key)
+            ws_cs.append([cs_key, mat, "I", prof])
+
+    # ── 5. Member 1D ─────────────────────────────────────────────────────────
+    ws_mem = _make_sheet("Member 1D", [
+        "Name", "Node 1", "Node 2", "Cross section", "Type",
+        "EccentricityBegin.z [m]", "EccentricityEnd.z [m]"
+    ])
+
+    if frame_df is not None and not frame_df.empty:
+        for _, r in frame_df.iterrows():
+            typ = str(r.get("Type", ""))
+            mid = str(r.get("ID", ""))
+            n1 = _get_node(r.get("X1 [m]", 0), r.get("Y1 [m]", 0), r.get("Z1 [m]", 0))
+            n2 = _get_node(r.get("X2 [m]", 0), r.get("Y2 [m]", 0), r.get("Z2 [m]", 0))
+            if typ == "Søyle":
+                cs = f"{col_mat}_{col_prof}"
+                mem_type = "COLUMN"
+            elif typ in ("Innv. bjelke",):
+                # HSQ-profil for innvendig drager ved hulldekke
+                _int_prof = str(r.get("Material / Tverrsnitt", "")).split("/")[-1].strip() or beam_prof
+                cs_key = f"{beam_mat}_{_int_prof}"
+                if cs_key not in cs_seen:
+                    cs_seen.add(cs_key)
+                    ws_cs.append([cs_key, beam_mat, "I", _int_prof])
+                cs = cs_key
+                mem_type = "BEAM"
+            else:
+                cs = f"{beam_mat}_{beam_prof}"
+                mem_type = "BEAM"
+            ws_mem.append([mid, n1, n2, cs, mem_type, 0, 0])
+
+    # ── 6. Point support – fast innspent ved søyle-bunnpunkt ─────────────────
+    ws_sup = _make_sheet("Support point", [
+        "Name", "Node", "SupportType",
+        "Tx", "Ty", "Tz", "Rx", "Ry", "Rz",
+        "Description"
+    ])
+    sup_idx = 1
+    seen_sup: set[str] = set()
+
+    if frame_df is not None and not frame_df.empty:
+        for _, r in frame_df.iterrows():
+            if str(r.get("Type", "")) != "Søyle":
+                continue
+            z1 = safe_num(r.get("Z1 [m]", 1.0))
+            if abs(z1) > 0.001:
+                continue
+            n1 = _get_node(r.get("X1 [m]", 0), r.get("Y1 [m]", 0), 0.0)
+            if n1 in seen_sup:
+                continue
+            seen_sup.add(n1)
+            rb_type = params.get("randbetingelse_type", "Fast innspent")
+            if rb_type == "Fri rotasjon":
+                # Ledd: fastholdt translasjon, fri rotasjon
+                ws_sup.append([f"SUP{sup_idx}", n1, "STANDARD",
+                                "Rigid", "Rigid", "Rigid", "Free", "Free", "Free",
+                                "Ledd"])
+            else:
+                # Fast innspent: alle frihetsgrader fastholdt
+                ws_sup.append([f"SUP{sup_idx}", n1, "STANDARD",
+                                "Rigid", "Rigid", "Rigid", "Rigid", "Rigid", "Rigid",
+                                "Fast innspent"])
+            sup_idx += 1
+
+    # ── 7. Member 2D – dekker fast forbundet til bjelker ─────────────────────
+    deck_mat   = params.get("dekke_materialtype", "Betong")
+    deck_qual  = params.get("dekke_kvalitet", "B35")
+    deck_thk_m = safe_num(params.get("dekke_tykkelse_mm", 300)) / 1000.0
+    deck_mat_name = f"{deck_mat} {deck_qual}"
+
+    # Legg til betongen som materiale hvis den ikke allerede er der
+    if deck_mat not in mat_seen:
+        mat_seen.add(deck_mat)
+        p = _mat_props.get(deck_mat, (33000, 13750, 0.2, 2400, "CONCRETE"))
+        ws_mat.append([deck_mat, p[0], p[1], p[2], p[3], p[4]])
+
+    if slab_df is not None and not slab_df.empty:
+        ws_2d = _make_sheet("Member 2D", [
+            "Name", "Nodes", "Material", "Thickness [m]", "Type",
+            "EccentricityZ [m]", "InternalElement"
+        ])
+
+        import json as _json
+        etasje_h_m = safe_num(params.get("etasjehoyde_mm", 3000)) / 1000.0
+
+        for _, sr in slab_df.iterrows():
+            level   = max(int(round(safe_num(sr.get("Nivå", 1)))), 1)
+            z_slab  = level * etasje_h_m          # topp dekke = bjelkenivå
+
+            # Fri-form: bruk polygon-punkter
+            poly_json = sr.get("poly_pts_json", None)
+            if poly_json and isinstance(poly_json, str) and poly_json.strip().startswith("["):
+                try:
+                    pts = [(float(p[0]), float(p[1])) for p in _json.loads(poly_json)]
+                except Exception:
+                    pts = []
+            else:
+                # Rektangel: hent P1–P4 som x,y-par
+                pts = []
+                for i in range(1, 5):
+                    raw = str(sr.get(f"P{i} (X,Y)", "") or "")
+                    nums = [float(v.strip()) / 1000.0 for v in raw.split(",")
+                            if v.strip().replace("-", "").replace(".", "").isdigit()]
+                    if len(nums) == 2:
+                        pts.append((nums[0], nums[1]))
+
+            if len(pts) < 3:
+                continue
+
+            # Registrer slab-hjørner som noder på BJELKENIVÅ (delt med rammen)
+            slab_nodes = [_get_node(x, y, z_slab) for x, y in pts]
+            node_names = " ".join(slab_nodes)
+
+            deck_id = str(sr.get("DeckID", f"D{level}"))
+            # Eksentrisitet: halvparten av dekketykkelsen nedover
+            ecc_z = -deck_thk_m / 2.0
+
+            ws_2d.append([deck_id, node_names, deck_mat_name, deck_thk_m, "PLATE", ecc_z, "No"])
+
+        # Oppdater node-arket med eventuelle nye slab-noder
+        ws_nodes = wb["Node"]
+        # Skriv alle noder på nytt (inkl. nye)
+        for row in ws_nodes.iter_rows(min_row=2):
+            for cell in row:
+                cell.value = None
+        row_idx = 2
+        for (x, y, z), nid in sorted(node_map.items(), key=lambda kv: int(kv[1][1:])):
+            ws_nodes.cell(row=row_idx, column=1, value=nid)
+            ws_nodes.cell(row=row_idx, column=2, value=x)
+            ws_nodes.cell(row=row_idx, column=3, value=y)
+            ws_nodes.cell(row=row_idx, column=4, value=z)
+            row_idx += 1
+
+    # ── Fjern default-ark og skriv til buffer ─────────────────────────────────
+    if "Sheet" in wb.sheetnames:
+        del wb["Sheet"]
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def generate_building_ifc_bytes(frame_df: pd.DataFrame, slab_df: pd.DataFrame, params: dict, project_name: str = "byggTotal generert bygg") -> bytes:
     """Genererer en enkel IFC4-fil fra Bygggeneratoren.
 
@@ -2082,6 +2315,90 @@ def generate_building_ifc_bytes(frame_df: pd.DataFrame, slab_df: pd.DataFrame, p
     for level, children in storey_children.items():
         if children:
             model.create_entity("IfcRelContainedInSpatialStructure", GlobalId=_ifc_guid(), RelatedElements=children, RelatingStructure=storeys[level])
+
+    # ── Randbetingelser: fast innspent ved alle søyle-bunnpunkter (Z≈0) ────────
+    if frame_df is not None and not frame_df.empty:
+        # Strukturanalysekontekst
+        sa_model = model.create_entity(
+            "IfcStructuralAnalysisModel",
+            GlobalId=_ifc_guid(), Name="Randbetingelser",
+            PredefinedType="NOTDEFINED",
+        )
+        # Randbetingelse-propertyset per søyle-bunnpunkt
+        rb_pset_props = [
+            model.create_entity("IfcPropertySingleValue", Name="SupportCondition",
+                                 NominalValue=model.create_entity("IfcLabel", wrappedValue="FIXED")),
+            model.create_entity("IfcPropertySingleValue", Name="TranslationalStiffnessX",
+                                 NominalValue=model.create_entity("IfcLabel", wrappedValue="RIGID")),
+            model.create_entity("IfcPropertySingleValue", Name="TranslationalStiffnessY",
+                                 NominalValue=model.create_entity("IfcLabel", wrappedValue="RIGID")),
+            model.create_entity("IfcPropertySingleValue", Name="TranslationalStiffnessZ",
+                                 NominalValue=model.create_entity("IfcLabel", wrappedValue="RIGID")),
+            model.create_entity("IfcPropertySingleValue", Name="RotationalStiffnessX",
+                                 NominalValue=model.create_entity("IfcLabel", wrappedValue="RIGID")),
+            model.create_entity("IfcPropertySingleValue", Name="RotationalStiffnessY",
+                                 NominalValue=model.create_entity("IfcLabel", wrappedValue="RIGID")),
+            model.create_entity("IfcPropertySingleValue", Name="RotationalStiffnessZ",
+                                 NominalValue=model.create_entity("IfcLabel", wrappedValue="RIGID")),
+        ]
+        rb_pset = model.create_entity("IfcPropertySet", GlobalId=_ifc_guid(),
+                                       Name="Pset_StructuralSupportCondition",
+                                       HasProperties=rb_pset_props)
+
+        sa_members = []
+        support_idx = 1
+        seen_support_pts: set[tuple] = set()
+        base_columns = []
+        for _, r in frame_df.iterrows():
+            if str(r.get("Type", "")) != "Søyle":
+                continue
+            z1 = safe_num(r.get("Z1 [m]", 1.0))
+            if abs(z1) > 0.001:
+                continue  # Kun bunn av første etasje
+            x = safe_num(r.get("X1 [m]"))
+            y = safe_num(r.get("Y1 [m]"))
+            key = (round(x, 3), round(y, 3))
+            if key in seen_support_pts:
+                continue
+            seen_support_pts.add(key)
+            sp_placement = _ifc_local_placement(model, None, x, y, 0.0,
+                                                 _ifc_dir(model, 0, 0, 1), _ifc_dir(model, 1, 0, 0))
+            sp_conn = model.create_entity(
+                "IfcStructuralPointConnection",
+                GlobalId=_ifc_guid(),
+                Name=f"Støtte_{support_idx}",
+                ObjectPlacement=sp_placement,
+            )
+            sa_members.append(sp_conn)
+            base_columns.append(sp_conn)
+            support_idx += 1
+        if sa_members:
+            model.create_entity("IfcRelAssignsToGroup", GlobalId=_ifc_guid(),
+                                  RelatedObjects=sa_members, RelatingGroup=sa_model)
+        if base_columns:
+            model.create_entity("IfcRelDefinesByProperties", GlobalId=_ifc_guid(),
+                                  RelatedObjects=base_columns, RelatingPropertyDefinition=rb_pset)
+
+    # ── Armerings-propertyset på betongdekker (løser gul advarsel) ──────────
+    if slab_df is not None and not slab_df.empty and deck_mat == "Betong":
+        reinf_pset = model.create_entity(
+            "IfcPropertySet",
+            GlobalId=_ifc_guid(),
+            Name="Pset_ConcreteElementGeneral",
+            HasProperties=[
+                model.create_entity("IfcPropertySingleValue", Name="ReinforcementVolumeRatio",
+                                     NominalValue=model.create_entity("IfcPositiveRatioMeasure", wrappedValue=0.015)),
+                model.create_entity("IfcPropertySingleValue", Name="ReinforcementStrengthClass",
+                                     NominalValue=model.create_entity("IfcLabel", wrappedValue="B500NC")),
+                model.create_entity("IfcPropertySingleValue", Name="ConcreteCoverAtMainBars",
+                                     NominalValue=model.create_entity("IfcPositiveLengthMeasure", wrappedValue=0.025)),
+            ]
+        )
+        # Finn alle IfcSlab-objekter og knytt armeringssettet til dem
+        all_slabs = [e for e in model.by_type("IfcSlab")]
+        if all_slabs:
+            model.create_entity("IfcRelDefinesByProperties", GlobalId=_ifc_guid(),
+                                  RelatedObjects=all_slabs, RelatingPropertyDefinition=reinf_pset)
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".ifc") as tmp:
         temp_path = tmp.name
@@ -2315,6 +2632,77 @@ def generate_complete_ifc_bytes(
         if children:
             model.create_entity("IfcRelContainedInSpatialStructure", GlobalId=_ifc_guid(),
                                  RelatedElements=children, RelatingStructure=storeys[level])
+
+    # ── Randbetingelser: fast innspent ved alle søyle-bunnpunkter (Z≈0) ────────
+    if frame_df is not None and not frame_df.empty:
+        sa_model = model.create_entity(
+            "IfcStructuralAnalysisModel",
+            GlobalId=_ifc_guid(), Name="Randbetingelser",
+            PredefinedType="NOTDEFINED",
+        )
+        bc_fast = model.create_entity(
+            "IfcBoundaryNodeCondition",
+            Name="Fast innspent",
+            TranslationalStiffnessX=True,
+            TranslationalStiffnessY=True,
+            TranslationalStiffnessZ=True,
+            RotationalStiffnessX=True,
+            RotationalStiffnessY=True,
+            RotationalStiffnessZ=True,
+        )
+        sa_members = []
+        support_idx = 1
+        seen_support_pts: set[tuple] = set()
+        for _, r in frame_df.iterrows():
+            if str(r.get("Type", "")) != "Søyle":
+                continue
+            z1 = safe_num(r.get("Z1 [m]", 1.0))
+            if abs(z1) > 0.001:
+                continue
+            x = safe_num(r.get("X1 [m]"))
+            y = safe_num(r.get("Y1 [m]"))
+            key = (round(x, 3), round(y, 3))
+            if key in seen_support_pts:
+                continue
+            seen_support_pts.add(key)
+            sp_placement = _ifc_local_placement(model, None, x, y, 0.0,
+                                                 _ifc_dir(model, 0, 0, 1), _ifc_dir(model, 1, 0, 0))
+            sp_conn = model.create_entity(
+                "IfcStructuralPointConnection",
+                GlobalId=_ifc_guid(),
+                Name=f"Støtte_{support_idx}",
+                ObjectPlacement=sp_placement,
+                AppliedCondition=bc_fast,
+            )
+            sa_members.append(sp_conn)
+            support_idx += 1
+        if sa_members:
+            model.create_entity(
+                "IfcRelAssignsToGroup",
+                GlobalId=_ifc_guid(),
+                RelatedObjects=sa_members,
+                RelatingGroup=sa_model,
+            )
+
+    # ── Armerings-propertyset på betongdekker (løser gul advarsel) ──────────
+    if slab_df is not None and not slab_df.empty and deck_mat == "Betong":
+        reinf_pset = model.create_entity(
+            "IfcPropertySet",
+            GlobalId=_ifc_guid(),
+            Name="Pset_ConcreteElementGeneral",
+            HasProperties=[
+                model.create_entity("IfcPropertySingleValue", Name="ReinforcementVolumeRatio",
+                                     NominalValue=model.create_entity("IfcPositiveRatioMeasure", wrappedValue=0.015)),
+                model.create_entity("IfcPropertySingleValue", Name="ReinforcementStrengthClass",
+                                     NominalValue=model.create_entity("IfcLabel", wrappedValue="B500NC")),
+                model.create_entity("IfcPropertySingleValue", Name="ConcreteCoverAtMainBars",
+                                     NominalValue=model.create_entity("IfcPositiveLengthMeasure", wrappedValue=0.025)),
+            ]
+        )
+        all_slabs = [e for e in model.by_type("IfcSlab")]
+        if all_slabs:
+            model.create_entity("IfcRelDefinesByProperties", GlobalId=_ifc_guid(),
+                                  RelatedObjects=all_slabs, RelatingPropertyDefinition=reinf_pset)
 
     # -----------------------------------------------------------------------
     # GRUNNFORHOLD
@@ -3878,7 +4266,7 @@ elif valg == "Bygggenerator":
     with st.expander("QA-kontroll"):
         st.dataframe(qa_df, use_container_width=True, hide_index=True)
 
-    dl1, dl2, dl3, dl4 = st.columns(4)
+    dl1, dl2, dl3, dl4, dl5 = st.columns(5)
     with dl1:
         st.download_button("Last ned mengder CSV", qty_df.to_csv(index=False).encode("utf-8-sig"), file_name="bygggenerator_mengder.csv", mime="text/csv")
     with dl2:
@@ -3895,6 +4283,15 @@ elif valg == "Bygggenerator":
                 st.download_button("Last ned bygg IFC", data=ifc_out, file_name="bygggenerator_generert_bygg.ifc", mime="application/octet-stream")
             except Exception as e:
                 st.error(f"Kunne ikke generere IFC: {e}")
+    with dl5:
+        try:
+            saf_out = generate_saf_bytes(frame_df, bg_params, project_name="byggTotal bygg", slab_df=slab_df)
+            st.download_button("Last ned SAF (Focus)", data=saf_out,
+                               file_name="bygggenerator_strukturmodell.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               help="SAF-format (Excel) for import i Focus Konstruksjon – inneholder søyler, bjelker og randbetingelser")
+        except Exception as e:
+            st.error(f"Kunne ikke generere SAF: {e}")
 
 elif valg == "Rapport":
     import matplotlib.pyplot as plt

@@ -334,6 +334,9 @@ def free_form_frame_export(
     def _col_row(seg_id, x, y, z_bot, z_top, level):
         length = z_top - z_bot
         vol = col_area * length
+        # Bunn av første etasje (z_bot ≈ 0) er fast innspent; øvrige knutepunkter er ledd
+        rb_bunn = "Fast innspent" if abs(z_bot) < 0.001 else "Ledd"
+        rb_topp = "Ledd"
         return {
             "ID": seg_id, "Segment": seg_id, "Type": "Søyle", "Nivå": level,
             "X1 [m]": round(x, 4), "Y1 [m]": round(y, 4), "Z1 [m]": round(z_bot, 4),
@@ -346,6 +349,8 @@ def free_form_frame_export(
             "Mengdegrunnlag": "Fri form", "Endret IFC": False,
             "Kostnad [kr]": round(length * col_cost_per_m, 0),
             "CO2 [kgCO2e]": round(vol * col_co2_per_m3, 1),
+            "Randbetingelse bunn": rb_bunn,
+            "Randbetingelse topp": rb_topp,
         }
 
     def _beam_row(seg_id, typ, ax_, ay_, bx_, by_, z_lev, level):
