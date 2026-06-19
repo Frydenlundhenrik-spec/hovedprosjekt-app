@@ -200,10 +200,86 @@ EPD_DATABASE = {
 }
 
 PROFILE_LIBRARY = {
-    "Limtre": ["90x315", "90x405", "115x315", "115x360", "115x405", "140x315", "140x360", "140x405", "140x450", "165x315", "165x360", "165x405", "190x405", "190x450", "215x405", "215x450"],
+    "Limtre": [
+        "90x270", "90x315", "90x360", "90x405", "90x450",
+        "115x270", "115x315", "115x360", "115x405", "115x450",
+        "140x270", "140x315", "140x360", "140x405", "140x450", "140x495",
+        "165x315", "165x360", "165x405", "165x450", "165x495",
+        "190x360", "190x405", "190x450", "190x495",
+        "215x360", "215x405", "215x450", "215x495",
+    ],
     "Massivtre": ["100x300", "120x300", "120x400", "140x400", "160x400", "200x400"],
-    "Stål": ["KFHUP 120x120x8", "KFHUP 140x140x10", "KFHUP 160x160x10", "KFHUP 180x180x12.5", "KFHUP 200x200x12.5", "KFHUP 220x220x12.5"],
-    "Betong": ["200x200", "250x250", "300x300", "350x350", "400x400"],
+    "Stål": [
+        # IPE
+        "IPE 100", "IPE 120", "IPE 140", "IPE 160", "IPE 180", "IPE 200",
+        "IPE 220", "IPE 240", "IPE 270", "IPE 300", "IPE 330", "IPE 360",
+        "IPE 400", "IPE 450", "IPE 500", "IPE 550", "IPE 600",
+        # HE-A
+        "HEA 100", "HEA 120", "HEA 140", "HEA 160", "HEA 180", "HEA 200",
+        "HEA 220", "HEA 240", "HEA 260", "HEA 280", "HEA 300", "HEA 320",
+        "HEA 340", "HEA 360", "HEA 400", "HEA 450", "HEA 500", "HEA 600",
+        # HE-B
+        "HEB 100", "HEB 120", "HEB 140", "HEB 160", "HEB 180", "HEB 200",
+        "HEB 220", "HEB 240", "HEB 260", "HEB 280", "HEB 300", "HEB 320",
+        "HEB 340", "HEB 360", "HEB 400", "HEB 450", "HEB 500", "HEB 600",
+        # HE-M / HE-C
+        "HEM 200", "HEM 240", "HEM 280", "HEM 300", "HEM 320", "HEM 360", "HEM 400",
+        # VFHUP kvadratisk (varmformet)
+        "VFHUP 80x80x5", "VFHUP 100x100x5", "VFHUP 120x120x6",
+        "VFHUP 150x150x8", "VFHUP 180x180x10", "VFHUP 200x200x10",
+        "VFHUP 250x250x12", "VFHUP 300x300x14",
+        # VFHUP rektangulær
+        "VFHUP 100x50x5", "VFHUP 120x60x5", "VFHUP 150x100x6",
+        "VFHUP 200x100x8", "VFHUP 250x150x10", "VFHUP 300x150x10",
+        # KFHUP kvadratisk (kaldformet)
+        "KFHUP 80x80x4", "KFHUP 100x100x5", "KFHUP 120x120x5",
+        "KFHUP 140x140x6", "KFHUP 150x150x6", "KFHUP 160x160x8",
+        "KFHUP 180x180x8", "KFHUP 200x200x10", "KFHUP 220x220x10",
+        "KFHUP 250x250x12", "KFHUP 300x300x12",
+        # KFHUP rektangulær
+        "KFHUP 100x50x4", "KFHUP 120x60x5", "KFHUP 150x100x5",
+        "KFHUP 200x100x6", "KFHUP 250x150x8", "KFHUP 300x150x8",
+        # Vinkelstål likebente (L)
+        "L 50x50x5", "L 60x60x6", "L 70x70x7", "L 80x80x8",
+        "L 90x90x9", "L 100x100x10", "L 120x120x12", "L 150x150x15",
+        # Vinkelstål ulikebente (L)
+        "L 80x60x7", "L 100x65x8", "L 120x80x10", "L 150x90x10", "L 200x100x12",
+        # UNP (U-profil normal)
+        "UNP 80", "UNP 100", "UNP 120", "UNP 140", "UNP 160",
+        "UNP 180", "UNP 200", "UNP 220", "UNP 240", "UNP 260", "UNP 280", "UNP 300",
+        # UPE (U-profil smal)
+        "UPE 80", "UPE 100", "UPE 120", "UPE 140", "UPE 160",
+        "UPE 180", "UPE 200", "UPE 220", "UPE 240", "UPE 270", "UPE 300",
+        # C-profil
+        "C 100x50x3", "C 120x55x3", "C 150x65x4", "C 180x70x5", "C 200x75x5",
+        # T-profil
+        "T 80x80x8", "T 100x100x10", "T 120x120x12", "T 150x150x15",
+        # Flatstål
+        "FL 60x8", "FL 80x10", "FL 100x10", "FL 120x12", "FL 150x12", "FL 200x16",
+        # Firkantstål (massivt kvadrat)
+        "SQ 20", "SQ 25", "SQ 30", "SQ 40", "SQ 50", "SQ 60",
+        # Bredflatstål
+        "FL 80x20", "FL 100x20", "FL 120x20", "FL 150x25", "FL 200x30",
+        # Runde hulprofiler (CHS)
+        "CHS 88.9x4", "CHS 114.3x5", "CHS 139.7x5", "CHS 168.3x6",
+        "CHS 193.7x6", "CHS 219.1x8", "CHS 244.5x8", "CHS 273x10", "CHS 323.9x10",
+        # Rundstål (massivt)
+        "RD 20", "RD 25", "RD 30", "RD 40", "RD 50", "RD 60", "RD 80",
+        # HSQ
+        "HSQ 200", "HSQ 240", "HSQ 280", "HSQ 300", "HSQ 320", "HSQ 360", "HSQ 400",
+        # THP (tynnplateprofil)
+        "THP 120x60x4", "THP 150x75x5", "THP 180x90x5", "THP 200x100x6",
+        # EHP / EHB
+        "EHB 200", "EHB 240", "EHB 280", "EHB 300", "EHB 320",
+        # FSQ
+        "FSQ 200", "FSQ 240", "FSQ 260", "FSQ 300", "FSQ 320",
+    ],
+    "Betong": [
+        "150x150", "200x200", "250x250", "300x300", "350x350",
+        "400x400", "450x450", "500x500", "600x600",
+        "200x300", "250x400", "300x500", "350x600",
+        "Ø200 rund", "Ø250 rund", "Ø300 rund", "Ø400 rund", "Ø500 rund",
+    ],
 }
 
 
@@ -1589,8 +1665,12 @@ QUALITY_LIBRARY = {
 }
 
 
-def quality_options(material: str):
-    return list(QUALITY_LIBRARY.get(material, {"Standard": {}}).keys())
+def quality_options(material: str) -> list[str]:
+    opts = list(QUALITY_LIBRARY.get(material, {"Standard": {}}).keys())
+    # S355 er standard – flytt den først
+    if "S355" in opts:
+        opts.insert(0, opts.pop(opts.index("S355")))
+    return opts
 
 
 def make_material_profile_label(material: str, quality: str, profile: str) -> str:
@@ -3611,17 +3691,41 @@ elif valg == "Bygggenerator":
         bg_params["bjelkemateriale"] = st.selectbox("Bjelkemateriale", ["Stål", "Limtre"], key="bg_beam_mat")
         bg_params["bjelkekvalitet"] = st.selectbox("Bjelkekvalitet", quality_options(bg_params["bjelkemateriale"]), key="bg_beam_qual")
         beam_profiles = PROFILE_LIBRARY.get(bg_params["bjelkemateriale"], PROFILE_LIBRARY["Stål"])
-        bg_params["bjelkeprofil"] = st.selectbox("Bjelkeprofil", beam_profiles, key="bg_beam_prof")
+        bg_params["bjelkeprofil"] = st.selectbox("Bjelkeprofil", beam_profiles,
+                                                   index=beam_profiles.index("IPE 300") if "IPE 300" in beam_profiles else 0,
+                                                   key="bg_beam_prof")
     with m2:
         bg_params["søylemateriale"] = st.selectbox("Søylemateriale", ["Stål", "Limtre", "Betong"], key="bg_col_mat")
         bg_params["søylekvalitet"] = st.selectbox("Søylekvalitet", quality_options(bg_params["søylemateriale"]), key="bg_col_qual")
         col_profiles = PROFILE_LIBRARY.get(bg_params["søylemateriale"], PROFILE_LIBRARY["Betong"])
-        bg_params["søyleprofil"] = st.selectbox("Søyleprofil", col_profiles, key="bg_col_prof")
+        _col_default = "HEB 200" if "HEB 200" in col_profiles else ("300x300" if "300x300" in col_profiles else col_profiles[0])
+        bg_params["søyleprofil"] = st.selectbox("Søyleprofil", col_profiles,
+                                                  index=col_profiles.index(_col_default),
+                                                  key="bg_col_prof")
     with m3:
         bg_params["dekke_materialtype"] = st.selectbox("Dekkemateriale", ["Betong", "Massivtre"], key="bg_deck_mat")
         bg_params["dekke_kvalitet"] = st.selectbox("Dekkekvalitet", quality_options(bg_params["dekke_materialtype"]), key="bg_deck_qual")
         bg_params["skalltype"] = st.selectbox("Skalltype", ["Platt skall", "Hulldekke-prinsipp", "Massivtredekke"], key="bg_shell")
         bg_params["dekke_materiale"] = make_material_profile_label(bg_params["dekke_materialtype"], bg_params["dekke_kvalitet"], f"t={bg_params['dekke_tykkelse_mm']:.0f} mm")
+        if bg_params["skalltype"] == "Hulldekke-prinsipp":
+            _thk_mm = float(bg_params["dekke_tykkelse_mm"])
+            _hsq_sizes = [200, 240, 280, 300, 320, 360, 400]
+            _auto_hsq = f"HSQ {min(_hsq_sizes, key=lambda h: abs(h - _thk_mm))}"
+            st.info(f"Innvendige dragere settes automatisk til **{_auto_hsq}** (tilsvarer hulldekke t={_thk_mm:.0f} mm)", icon="ℹ️")
+
+    st.subheader("3. Randbetingelser")
+    rb1, rb2 = st.columns([1, 3])
+    with rb1:
+        _rb_ja = st.radio("Randbetingelser", ["Ja", "Nei"], index=0, horizontal=True, key="bg_rb_aktiv",
+                           label_visibility="visible")
+        bg_params["randbetingelser_aktiv"] = _rb_ja == "Ja"
+    with rb2:
+        if bg_params["randbetingelser_aktiv"]:
+            _rb_type = st.radio("Type", ["Fast innspent", "Fri rotasjon"], index=0,
+                                 key="bg_rb_type", label_visibility="collapsed")
+            bg_params["randbetingelse_type"] = _rb_type
+        else:
+            bg_params["randbetingelse_type"] = "Ingen"
 
     n_etasjer  = int(bg_params["antall_etasjer"])
     etasje_h_m = float(bg_params["etasjehoyde_mm"]) / 1000.0
@@ -3629,17 +3733,31 @@ elif valg == "Bygggenerator":
 
     if fri_form_aktiv and _FREE_FORM_OK and _ff_vertices and len(_ff_vertices) >= 3:
         # ── Fri-form pipeline ──────────────────────────────────────────────────
+
+        # HSQ-høyde matcher hulldekketykkelsen (265 mm → nærmeste HSQ-størrelse)
+        def _hsq_for_thickness(thk_mm: float) -> str:
+            _hsq_sizes = [200, 240, 280, 300, 320, 360, 400]
+            return f"HSQ {min(_hsq_sizes, key=lambda h: abs(h - thk_mm))}"
+
+        _is_hulldekke = bg_params.get("skalltype", "") == "Hulldekke-prinsipp"
+        _int_b_prof  = _hsq_for_thickness(float(bg_params["dekke_tykkelse_mm"])) if _is_hulldekke else None
+        _int_b_mat   = "Stål" if _is_hulldekke else None
+        _int_b_qual  = bg_params.get("bjelkekvalitet", "S355") if _is_hulldekke else None
+
         frame_df = free_form_frame_export(
-            vertices      = _ff_vertices,
-            n_levels      = n_etasjer,
-            floor_h_m     = etasje_h_m,
-            col_mat       = bg_params.get("søylemateriale", "Stål"),
-            col_qual      = bg_params.get("søylekvalitet", "S355"),
-            col_prof      = bg_params.get("søyleprofil", "HEB 200"),
-            beam_mat      = bg_params.get("bjelkemateriale", "Stål"),
-            beam_qual     = bg_params.get("bjelkekvalitet", "S355"),
-            beam_prof     = bg_params.get("bjelkeprofil", "HEB 300"),
-            max_span_m    = float(bg_params.get("ff_max_span_m", 6.0)),
+            vertices             = _ff_vertices,
+            n_levels             = n_etasjer,
+            floor_h_m            = etasje_h_m,
+            col_mat              = bg_params.get("søylemateriale", "Stål"),
+            col_qual             = bg_params.get("søylekvalitet", "S355"),
+            col_prof             = bg_params.get("søyleprofil", "HEB 200"),
+            beam_mat             = bg_params.get("bjelkemateriale", "Stål"),
+            beam_qual            = bg_params.get("bjelkekvalitet", "S355"),
+            beam_prof            = bg_params.get("bjelkeprofil", "IPE 300"),
+            max_span_m           = float(bg_params.get("ff_max_span_m", 6.0)),
+            interior_beam_mat    = _int_b_mat,
+            interior_beam_qual   = _int_b_qual,
+            interior_beam_prof   = _int_b_prof,
         )
         slab_df = (
             free_form_slab_export(

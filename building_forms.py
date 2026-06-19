@@ -282,6 +282,9 @@ def free_form_frame_export(
     col_co2_per_m3: float = 7200.0,
     beam_cost_per_m: float = 6200.0,
     beam_co2_per_m3: float = 6800.0,
+    interior_beam_mat: str | None = None,
+    interior_beam_qual: str | None = None,
+    interior_beam_prof: str | None = None,
 ) -> pd.DataFrame:
     """
     Genererer søyler og bjelker langs polygon-kantene per etasje.
@@ -315,8 +318,14 @@ def free_form_frame_export(
             pass
         return 0.02
 
-    col_area  = _prof_area_m2(col_prof)
-    beam_area = _prof_area_m2(beam_prof)
+    # Innvendige bjelker kan ha separat profil (f.eks. HSQ ved hulldekke)
+    int_b_mat  = interior_beam_mat  or beam_mat
+    int_b_qual = interior_beam_qual or beam_qual
+    int_b_prof = interior_beam_prof or beam_prof
+
+    col_area      = _prof_area_m2(col_prof)
+    beam_area     = _prof_area_m2(beam_prof)
+    int_beam_area = _prof_area_m2(int_b_prof)
 
     rows = []
     col_id = 1
@@ -384,7 +393,21 @@ def free_form_frame_export(
         for (ax_, ay_), (bx_, by_) in interior_lines:
             if math.hypot(bx_ - ax_, by_ - ay_) < 0.05:
                 continue
-            rows.append(_beam_row(f"BI{beam_id}", "Innv. bjelke", ax_, ay_, bx_, by_, z1, level))
+            seg_len = math.hypot(bx_ - ax_, by_ - ay_)
+            vol = int_beam_area * seg_len
+            rows.append({
+                "ID": f"BI{beam_id}", "Segment": f"BI{beam_id}", "Type": "Innv. bjelke", "Nivå": level,
+                "X1 [m]": round(ax_, 4), "Y1 [m]": round(ay_, 4), "Z1 [m]": round(z1, 4),
+                "X2 [m]": round(bx_, 4), "Y2 [m]": round(by_, 4), "Z2 [m]": round(z1, 4),
+                "Knutepunkter": f"({ax_:.2f},{ay_:.2f},{z1:.2f})-({bx_:.2f},{by_:.2f},{z1:.2f})",
+                "Material / Tverrsnitt": f"{int_b_mat} {int_b_qual} / {int_b_prof}",
+                "Lengde [m]": round(seg_len, 3), "Areal [m2]": round(int_beam_area, 5),
+                "Volum [m3]": round(vol, 4), "Vekt [kg]": round(vol * _density(int_b_mat), 1),
+                "materiale": int_b_mat, "Materialkvalitet": int_b_qual,
+                "Mengdegrunnlag": "Fri form", "Endret IFC": False,
+                "Kostnad [kr]": round(seg_len * beam_cost_per_m, 0),
+                "CO2 [kgCO2e]": round(vol * beam_co2_per_m3, 1),
+            })
             beam_id += 1
 
     return pd.DataFrame(rows)
