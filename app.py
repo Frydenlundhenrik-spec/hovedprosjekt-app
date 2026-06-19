@@ -1541,6 +1541,7 @@ def plot_plan_geometry(geom: dict):
 
 
 from reports import build_docx_report, build_pdf_report, make_report_summary_dict
+from chatbot import vis_chatbot
 
 
 
@@ -3969,3 +3970,25 @@ elif valg == "Innstillinger":
 
 st.markdown("---")
 st.markdown("**byggTotal**")
+
+# ── AI-assistent (vises alltid nederst) ──────────────────────────────────────
+_kontekst_deler = []
+if filename:
+    _kontekst_deler.append(f"Prosjektfil: {filename}")
+if data is not None and not data.empty:
+    _kontekst_deler.append(f"Antall elementer: {len(data)}")
+    if "Material / Tverrsnitt" in data.columns:
+        _top_mat = data["Material / Tverrsnitt"].value_counts().head(3)
+        _kontekst_deler.append(f"Vanligste materialer: {', '.join(_top_mat.index.tolist())}")
+    if "Vekt [kg]" in data.columns:
+        _tot_vekt = data["Vekt [kg]"].sum()
+        _kontekst_deler.append(f"Total vekt: {_tot_vekt:,.0f} kg")
+    if "Volum [m3]" in data.columns:
+        _tot_vol = data["Volum [m3]"].sum()
+        _kontekst_deler.append(f"Totalt volum: {_tot_vol:,.1f} m³")
+if _kontekst_deler:
+    _bt_kontekst = "\n".join(f"- {d}" for d in _kontekst_deler)
+else:
+    _bt_kontekst = "Ingen prosjektfil lastet opp ennå."
+
+vis_chatbot(kontekst=_bt_kontekst)
