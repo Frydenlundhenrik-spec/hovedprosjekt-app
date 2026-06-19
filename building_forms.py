@@ -322,54 +322,52 @@ def free_form_frame_export(
     col_id = 1
     beam_id = 1
 
+    def _col_row(seg_id, x, y, z_bot, z_top, level):
+        length = z_top - z_bot
+        vol = col_area * length
+        return {
+            "ID": seg_id, "Segment": seg_id, "Type": "Søyle", "Nivå": level,
+            "X1 [m]": round(x, 4), "Y1 [m]": round(y, 4), "Z1 [m]": round(z_bot, 4),
+            "X2 [m]": round(x, 4), "Y2 [m]": round(y, 4), "Z2 [m]": round(z_top, 4),
+            "Knutepunkter": f"({x:.2f},{y:.2f},{z_bot:.2f})-({x:.2f},{y:.2f},{z_top:.2f})",
+            "Material / Tverrsnitt": f"{col_mat} {col_qual} / {col_prof}",
+            "Lengde [m]": round(length, 3), "Areal [m2]": round(col_area, 5),
+            "Volum [m3]": round(vol, 4), "Vekt [kg]": round(vol * _density(col_mat), 1),
+            "materiale": col_mat, "Materialkvalitet": col_qual,
+            "Mengdegrunnlag": "Fri form", "Endret IFC": False,
+            "Kostnad [kr]": round(length * col_cost_per_m, 0),
+            "CO2 [kgCO2e]": round(vol * col_co2_per_m3, 1),
+        }
+
+    def _beam_row(seg_id, typ, ax_, ay_, bx_, by_, z_lev, level):
+        seg_len = math.hypot(bx_ - ax_, by_ - ay_)
+        vol = beam_area * seg_len
+        return {
+            "ID": seg_id, "Segment": seg_id, "Type": typ, "Nivå": level,
+            "X1 [m]": round(ax_, 4), "Y1 [m]": round(ay_, 4), "Z1 [m]": round(z_lev, 4),
+            "X2 [m]": round(bx_, 4), "Y2 [m]": round(by_, 4), "Z2 [m]": round(z_lev, 4),
+            "Knutepunkter": f"({ax_:.2f},{ay_:.2f},{z_lev:.2f})-({bx_:.2f},{by_:.2f},{z_lev:.2f})",
+            "Material / Tverrsnitt": f"{beam_mat} {beam_qual} / {beam_prof}",
+            "Lengde [m]": round(seg_len, 3), "Areal [m2]": round(beam_area, 5),
+            "Volum [m3]": round(vol, 4), "Vekt [kg]": round(vol * _density(beam_mat), 1),
+            "materiale": beam_mat, "Materialkvalitet": beam_qual,
+            "Mengdegrunnlag": "Fri form", "Endret IFC": False,
+            "Kostnad [kr]": round(seg_len * beam_cost_per_m, 0),
+            "CO2 [kgCO2e]": round(vol * beam_co2_per_m3, 1),
+        }
+
     for level in range(1, n_levels + 1):
         z0 = (level - 1) * floor_h_m
         z1 = level * floor_h_m
 
         # Innvendige grid-søyler
         for x, y in grid_col_pts:
-            length = floor_h_m
-            vol    = col_area * length
-            rows.append({
-                "Segment": f"SI{col_id}",
-                "Type": "Søyle",
-                "Nivå": level,
-                "Knutepunkter": f"({x:.2f},{y:.2f},{z0:.2f})-({x:.2f},{y:.2f},{z1:.2f})",
-                "Material / Tverrsnitt": f"{col_mat} {col_qual} / {col_prof}",
-                "Lengde [m]": round(length, 3),
-                "Areal [m2]": round(col_area, 5),
-                "Volum [m3]": round(vol, 4),
-                "Vekt [kg]": round(vol * _density(col_mat), 1),
-                "materiale": col_mat,
-                "Materialkvalitet": col_qual,
-                "Mengdegrunnlag": "Fri form",
-                "Endret IFC": False,
-                "Kostnad [kr]": round(length * col_cost_per_m, 0),
-                "CO2 [kgCO2e]": round(vol * col_co2_per_m3, 1),
-            })
+            rows.append(_col_row(f"SI{col_id}", x, y, z0, z1, level))
             col_id += 1
 
-        # Perimetre-søyler på alle unike punkter langs kantene
+        # Perimetre-søyler langs kantene
         for x, y in all_col_positions:
-            length = floor_h_m
-            vol    = col_area * length
-            rows.append({
-                "Segment": f"S{col_id}",
-                "Type": "Søyle",
-                "Nivå": level,
-                "Knutepunkter": f"({x:.2f},{y:.2f},{z0:.2f})-({x:.2f},{y:.2f},{z1:.2f})",
-                "Material / Tverrsnitt": f"{col_mat} {col_qual} / {col_prof}",
-                "Lengde [m]": round(length, 3),
-                "Areal [m2]": round(col_area, 5),
-                "Volum [m3]": round(vol, 4),
-                "Vekt [kg]": round(vol * _density(col_mat), 1),
-                "materiale": col_mat,
-                "Materialkvalitet": col_qual,
-                "Mengdegrunnlag": "Fri form",
-                "Endret IFC": False,
-                "Kostnad [kr]": round(length * col_cost_per_m, 0),
-                "CO2 [kgCO2e]": round(vol * col_co2_per_m3, 1),
-            })
+            rows.append(_col_row(f"S{col_id}", x, y, z0, z1, level))
             col_id += 1
 
         # Bjelker mellom nabokolonner langs kantene
@@ -377,52 +375,16 @@ def free_form_frame_export(
             for j in range(len(pts) - 1):
                 ax_, ay_ = pts[j]
                 bx_, by_ = pts[j + 1]
-                seg_len = math.hypot(bx_ - ax_, by_ - ay_)
-                if seg_len < 0.01:
+                if math.hypot(bx_ - ax_, by_ - ay_) < 0.01:
                     continue
-                vol = beam_area * seg_len
-                rows.append({
-                    "Segment": f"B{beam_id}",
-                    "Type": "Bjelke",
-                    "Nivå": level,
-                    "Knutepunkter": f"({ax_:.2f},{ay_:.2f},{z1:.2f})-({bx_:.2f},{by_:.2f},{z1:.2f})",
-                    "Material / Tverrsnitt": f"{beam_mat} {beam_qual} / {beam_prof}",
-                    "Lengde [m]": round(seg_len, 3),
-                    "Areal [m2]": round(beam_area, 5),
-                    "Volum [m3]": round(vol, 4),
-                    "Vekt [kg]": round(vol * _density(beam_mat), 1),
-                    "materiale": beam_mat,
-                    "Materialkvalitet": beam_qual,
-                    "Mengdegrunnlag": "Fri form",
-                    "Endret IFC": False,
-                    "Kostnad [kr]": round(seg_len * beam_cost_per_m, 0),
-                    "CO2 [kgCO2e]": round(vol * beam_co2_per_m3, 1),
-                })
+                rows.append(_beam_row(f"B{beam_id}", "Bjelke", ax_, ay_, bx_, by_, z1, level))
                 beam_id += 1
 
         # Innvendige bjelker for å holde dekke-spenn ≤ max_span_m
         for (ax_, ay_), (bx_, by_) in interior_lines:
-            seg_len = math.hypot(bx_ - ax_, by_ - ay_)
-            if seg_len < 0.05:
+            if math.hypot(bx_ - ax_, by_ - ay_) < 0.05:
                 continue
-            vol = beam_area * seg_len
-            rows.append({
-                "Segment": f"BI{beam_id}",
-                "Type": "Innv. bjelke",
-                "Nivå": level,
-                "Knutepunkter": f"({ax_:.2f},{ay_:.2f},{z1:.2f})-({bx_:.2f},{by_:.2f},{z1:.2f})",
-                "Material / Tverrsnitt": f"{beam_mat} {beam_qual} / {beam_prof}",
-                "Lengde [m]": round(seg_len, 3),
-                "Areal [m2]": round(beam_area, 5),
-                "Volum [m3]": round(vol, 4),
-                "Vekt [kg]": round(vol * _density(beam_mat), 1),
-                "materiale": beam_mat,
-                "Materialkvalitet": beam_qual,
-                "Mengdegrunnlag": "Fri form",
-                "Endret IFC": False,
-                "Kostnad [kr]": round(seg_len * beam_cost_per_m, 0),
-                "CO2 [kgCO2e]": round(vol * beam_co2_per_m3, 1),
-            })
+            rows.append(_beam_row(f"BI{beam_id}", "Innv. bjelke", ax_, ay_, bx_, by_, z1, level))
             beam_id += 1
 
     return pd.DataFrame(rows)
@@ -438,11 +400,15 @@ def free_form_slab_export(
     cost_per_m2: float = 1650.0,
     co2_per_m3: float = 380.0,
 ) -> pd.DataFrame:
-    """Ett dekke per etasje = polygon-arealet."""
+    """Ett dekke per etasje = polygon-arealet. Inkluderer polygon-geometri for IFC-eksport."""
+    import json as _json
     area = free_form_area(vertices)
+    # Polygon-koordinater som JSON for presis IFC-geometri
+    poly_json = _json.dumps([[round(x, 4), round(y, 4)] for x, y in vertices])
+
     rows = []
     for level in range(1, n_levels + 1):
-        z = level * floor_h_m
+        z_mm = int(round(level * floor_h_m * 1000))
         vol    = area * slab_thk_m
         weight = vol * _density(slab_mat)
         cost   = area * cost_per_m2
@@ -451,7 +417,10 @@ def free_form_slab_export(
             "DeckID": f"D{level}",
             "Type": "Dekke",
             "Nivå": level,
-            "Knutepunkter": f"z={z:.2f}m",
+            # Polygon-form for IFC-eksport
+            "poly_pts_json": poly_json,
+            "Z [mm]": z_mm,
+            "Knutepunkter": f"z={level*floor_h_m:.2f}m",
             "Material / Tverrsnitt": f"{slab_mat} {slab_qual} / t={round(slab_thk_m*1000)} mm",
             "Lengde [m]": float("nan"),
             "Areal [m2]": round(area, 2),

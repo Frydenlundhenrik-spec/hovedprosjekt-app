@@ -1806,6 +1806,32 @@ def _ifc_product_shape(model, context, width: float, height: float, depth: float
     return model.create_entity("IfcProductDefinitionShape", Representations=[body])
 
 
+def _ifc_polygon_slab_shape(model, context, poly_pts: list[tuple[float, float]], depth: float):
+    """Lager IfcSlab-geometri med vilkårlig polygon-profil (IfcArbitraryClosedProfileDef)."""
+    # Lukkede polygon: siste punkt = første punkt
+    ifc_pts = [model.create_entity("IfcCartesianPoint", Coordinates=(float(x), float(y)))
+               for x, y in poly_pts]
+    ifc_pts.append(ifc_pts[0])  # lukk løkken
+    polyline = model.create_entity("IfcPolyline", Points=ifc_pts)
+    profile  = model.create_entity("IfcArbitraryClosedProfileDef",
+                                    ProfileType="AREA", OuterCurve=polyline)
+    solid = model.create_entity(
+        "IfcExtrudedAreaSolid",
+        SweptArea=profile,
+        Position=_ifc_axis3d(model),
+        ExtrudedDirection=_ifc_dir(model, 0, 0, 1),
+        Depth=max(float(depth), 0.001),
+    )
+    body = model.create_entity(
+        "IfcShapeRepresentation",
+        ContextOfItems=context,
+        RepresentationIdentifier="Body",
+        RepresentationType="SweptSolid",
+        Items=[solid],
+    )
+    return model.create_entity("IfcProductDefinitionShape", Representations=[body])
+
+
 def _get_profile_dims_m(profile_text: str, material_hint: str, fallback=(0.2, 0.2)):
     nums = [float(x.replace(",", ".")) for x in re.findall(r"\d+[\.,]?\d*", str(profile_text or ""))]
     if len(nums) >= 2:
@@ -1928,6 +1954,29 @@ def generate_building_ifc_bytes(frame_df: pd.DataFrame, slab_df: pd.DataFrame, p
     if slab_df is not None and not slab_df.empty:
         for _, r in slab_df.iterrows():
             level = max(int(round(safe_num(r.get("Nivå", 1)))), 1)
+            z_top = safe_num(r.get("Z [mm]", level * etasjeh * 1000)) / 1000.0
+            slab_name = str(r.get("DeckID", f"Dekke {level}"))
+
+            # Polygon-form (fri form) prioriteres over rektangel
+            poly_json = r.get("poly_pts_json", None)
+            if poly_json and isinstance(poly_json, str) and poly_json.strip().startswith("["):
+                import json as _json
+                try:
+                    poly_pts = [(float(p[0]), float(p[1])) for p in _json.loads(poly_json)]
+                    if len(poly_pts) >= 3:
+                        shape = _ifc_polygon_slab_shape(model, context, poly_pts, deck_thk)
+                        placement = _ifc_local_placement(model, None, 0.0, 0.0, z_top - deck_thk,
+                                                         _ifc_dir(model, 0, 0, 1), _ifc_dir(model, 1, 0, 0))
+                        slab = model.create_entity("IfcSlab", GlobalId=_ifc_guid(), Name=slab_name,
+                                                   ObjectPlacement=placement, Representation=shape, PredefinedType="FLOOR")
+                        assign_material(slab, f"{deck_mat} {deck_quality}")
+                        if level in storey_children:
+                            storey_children[level].append(slab)
+                        continue
+                except Exception:
+                    pass  # fall through to rectangle
+
+            # Rektangel-fallback (standard bygggenerator)
             pts = []
             for i in range(1, 9):
                 raw = str(r.get(f"P{i} (X,Y)", "") or "")
@@ -1941,10 +1990,11 @@ def generate_building_ifc_bytes(frame_df: pd.DataFrame, slab_df: pd.DataFrame, p
                 ymin, ymax = min(ys), max(ys)
                 width = max(xmax - xmin, 0.001)
                 depth = max(ymax - ymin, 0.001)
-                z_top = safe_num(r.get("Z [mm]", level * etasjeh * 1000)) / 1000.0
                 shape = _ifc_product_shape(model, context, width, depth, deck_thk)
-                placement = _ifc_local_placement(model, None, xmin + width / 2.0, ymin + depth / 2.0, z_top - deck_thk, _ifc_dir(model, 0, 0, 1), _ifc_dir(model, 1, 0, 0))
-                slab = model.create_entity("IfcSlab", GlobalId=_ifc_guid(), Name=str(r.get("DeckID", f"Dekke {level}")), ObjectPlacement=placement, Representation=shape, PredefinedType="FLOOR")
+                placement = _ifc_local_placement(model, None, xmin + width / 2.0, ymin + depth / 2.0,
+                                                  z_top - deck_thk, _ifc_dir(model, 0, 0, 1), _ifc_dir(model, 1, 0, 0))
+                slab = model.create_entity("IfcSlab", GlobalId=_ifc_guid(), Name=slab_name,
+                                           ObjectPlacement=placement, Representation=shape, PredefinedType="FLOOR")
                 assign_material(slab, f"{deck_mat} {deck_quality}")
                 if level in storey_children:
                     storey_children[level].append(slab)
