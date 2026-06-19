@@ -71,7 +71,7 @@ def vis_chatbot(kontekst: str = ""):
             st.markdown(msg["content"])
 
     # ── Ny melding ────────────────────────────────────────────────────────────
-    bruker_input = st.chat_input("Still et spørsmål om kjølerommet ditt…", key="chatbot_input")
+    bruker_input = st.chat_input("Hva kan jeg hjelpe deg med?", key="chatbot_input")
     if not bruker_input:
         return
 

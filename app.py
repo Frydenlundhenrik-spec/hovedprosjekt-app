@@ -38,6 +38,22 @@ try:
 except Exception:
     SimpleDocTemplate = None
 
+try:
+    from building_forms import (
+        generate_free_form_vertices,
+        free_form_frame_export,
+        free_form_slab_export,
+        free_form_area,
+        free_form_perimeter,
+        plot_free_form_plan,
+        plot_free_form_3d,
+        _edge_column_points,
+        _grid_lines,
+    )
+    _FREE_FORM_OK = True
+except Exception:
+    _FREE_FORM_OK = False
+
 
 # ---------------------------------------------------------------------------
 # MODUL-OVERSIKT
@@ -2737,12 +2753,13 @@ elif valg == "Grunn":
     st.header("🌍 Grunn og georeferering")
     active_breeam_level = st.session_state.get("breeam_target_level", "Ingen") if st.session_state.get("breeam_active", False) else "Ingen"
 
-    ground_tab1, ground_tab2, ground_tab3, ground_tab4, ground_tab5 = st.tabs([
+    ground_tab1, ground_tab2, ground_tab3, ground_tab4, ground_tab5, ground_tab6 = st.tabs([
         "📍 Stikningsdata / terreng",
         "🗺️ Georeferering",
         "🪨 Geoteknikk og profil",
         "🏗️ Fundamentering og peling",
         "🌿 CO₂-regnskap grunn",
+        "⚖️ Masseregnskap",
     ])
 
     # -----------------------------------------------------------------------
@@ -3102,6 +3119,186 @@ elif valg == "Grunn":
 
         st.download_button("Last ned CO₂-regnskap CSV", co2_df.to_csv(index=False).encode("utf-8-sig"), file_name="grunn_co2.csv", mime="text/csv")
 
+    # -----------------------------------------------------------------------
+    # TAB 6 – MASSEREGNSKAP
+    # -----------------------------------------------------------------------
+    with ground_tab6:
+        st.subheader("⚖️ Masseregnskap og massebalanse")
+        st.caption("Beregn skjæring, fylling, lass og netto massebalanse. Tilpass utvidelsesfaktorer etter jordart og prosjektbehov.")
+
+        # ── Inndata ──────────────────────────────────────────────────────────
+        st.markdown("### 1. Terrengvolumer")
+        mb_c1, mb_c2 = st.columns(2)
+        with mb_c1:
+            # Hent fra Stikningsdata-fanen hvis tilgjengelig
+            _default_cut  = float(st.session_state.get("rapport_grunn_cut",  "0").replace(" m³","").replace(" ","") or 0)
+            _default_fill = float(st.session_state.get("rapport_grunn_fill", "0").replace(" m³","").replace(" ","") or 0)
+            mb_skjaering = st.number_input("Skjæringsvolum – fast masse [m³]", min_value=0.0,
+                                           value=max(_default_cut, 0.0), step=50.0, key="mb_cut",
+                                           help="Volum masse som graves bort i fast tilstand (banke / berg / jord)")
+            mb_fylling_behov = st.number_input("Fyllbehov – løs masse [m³]", min_value=0.0,
+                                               value=max(_default_fill, 0.0), step=50.0, key="mb_fill",
+                                               help="Volum masse som trengs i løs tilstand til oppfylling")
+        with mb_c2:
+            mb_overbygg = st.number_input("Overbygning / toppmasse fjernes [m³]", min_value=0.0,
+                                          value=0.0, step=10.0, key="mb_overbygg",
+                                          help="Matjord/torv som må kjøres bort (ikke gjenbrukes)")
+            mb_fundament_tilsats = st.number_input("Tilleggsvolum fundamentgrøfter [m³]", min_value=0.0,
+                                                   value=0.0, step=10.0, key="mb_fund_tilsats")
+
+        st.markdown("### 2. Utvidelsesfaktorer")
+        st.info("**Anbefaling:** Leire/silt ≈ 1.25–1.35 · Sand/grus ≈ 1.10–1.20 · Fjell/sprengstein ≈ 1.50–1.70", icon="ℹ️")
+        ef_c1, ef_c2, ef_c3 = st.columns(3)
+        with ef_c1:
+            ef_los  = st.number_input("Løsningsfaktor (fast → løs)",
+                                      min_value=1.00, max_value=2.50, value=1.25, step=0.05, key="mb_ef_los",
+                                      help="Hvor mye massen sveller ved oppgraving. Fast masse × faktor = løs masse.")
+        with ef_c2:
+            ef_komp = st.number_input("Komprimeringsgrad (løs → komprimert)",
+                                      min_value=0.70, max_value=1.20, value=0.95, step=0.05, key="mb_ef_komp",
+                                      help="Komprimert fyllvolum / løst volum. <1 = massen pakker seg.")
+        with ef_c3:
+            ef_over = st.number_input("Overbygning løsningsfaktor",
+                                      min_value=1.00, max_value=2.00, value=1.15, step=0.05, key="mb_ef_over",
+                                      help="Løsningsfaktor for toppmasse/torv.")
+
+        st.markdown("### 3. Transport")
+        tr_c1, tr_c2, tr_c3 = st.columns(3)
+        with tr_c1:
+            mb_lass_m3 = st.number_input("Lassekapasitet pr. lass [m³ løs masse]",
+                                         min_value=1.0, max_value=30.0, value=10.0, step=0.5, key="mb_lass",
+                                         help="Typisk dumper: 10–14 m³ · Lastebil: 8–12 m³")
+        with tr_c2:
+            mb_km_bort = st.number_input("Transportavstand til deponi [km]",
+                                         min_value=0.0, max_value=200.0, value=5.0, step=0.5, key="mb_km_bort")
+        with tr_c3:
+            mb_km_inn  = st.number_input("Transportavstand fra leverandør [km]",
+                                         min_value=0.0, max_value=200.0, value=10.0, step=0.5, key="mb_km_inn")
+
+        # ── Beregninger ───────────────────────────────────────────────────────
+        # Skjæring
+        skj_fast     = mb_skjaering + mb_fundament_tilsats          # fast m³ som graves
+        skj_los      = skj_fast * ef_los                             # løs m³ ved oppgraving
+        overbygg_los = mb_overbygg * ef_over                         # løs m³ toppmasse
+
+        # Hva kan gjenbrukes til fylling?
+        # Fyllbehov angitt som løs masse; komprimert = behov × 1/ef_komp
+        fill_los_behov   = mb_fylling_behov                          # løs m³ som trengs
+        fill_komp_behov  = fill_los_behov * ef_komp                  # komprimert volum
+
+        # Tilgjengelig for gjenbruk: skjæringsmasse (løs) minus overbygning
+        til_gjenbruk_los = max(skj_los - overbygg_los, 0.0)
+        # Hvor mye av fyllbehovet kan dekkes av skjæringsmasse?
+        gjenbruk_til_fill = min(til_gjenbruk_los, fill_los_behov)
+        # Overskudd og underskudd
+        overskudd_los    = max(til_gjenbruk_los - fill_los_behov, 0.0)
+        underskudd_los   = max(fill_los_behov - til_gjenbruk_los, 0.0)
+
+        # Lass
+        lass_bort_skj  = math.ceil(skj_los / mb_lass_m3)            # skjæringsmasse til deponi
+        lass_bort_over = math.ceil(overbygg_los / mb_lass_m3)        # overbygning til deponi
+        lass_bort_tot  = math.ceil((skj_los + overbygg_los - gjenbruk_til_fill) / mb_lass_m3)
+        lass_inn       = math.ceil(underskudd_los / mb_lass_m3)      # masse som kjøres inn
+
+        netto_balanse   = til_gjenbruk_los - fill_los_behov          # positiv = overskudd
+
+        # ── Nøkkeltall ────────────────────────────────────────────────────────
+        st.markdown("### 4. Massebalanse – nøkkeltall")
+        kk1, kk2, kk3, kk4 = st.columns(4)
+        with kk1: metric_card("Skjæring (fast)",     f"{skj_fast:,.0f} m³".replace(",", " "))
+        with kk2: metric_card("Skjæring (løs)",      f"{skj_los:,.0f} m³".replace(",", " "))
+        with kk3: metric_card("Fyllbehov (løs)",     f"{fill_los_behov:,.0f} m³".replace(",", " "))
+        with kk4:
+            bal_color = "#d4edda" if netto_balanse >= 0 else "#f8d7da"
+            bal_text  = f"+{netto_balanse:,.0f} m³ overskudd" if netto_balanse >= 0 else f"{netto_balanse:,.0f} m³ underskudd"
+            st.markdown(
+                f"<div style='background:{bal_color};border-radius:8px;padding:0.6rem 1rem;"
+                f"text-align:center'><div style='font-size:0.75rem;color:#555'>Netto balanse</div>"
+                f"<div style='font-size:1.1rem;font-weight:700'>{bal_text.replace(',', ' ')}</div></div>",
+                unsafe_allow_html=True,
+            )
+
+        kk5, kk6, kk7, kk8 = st.columns(4)
+        with kk5: metric_card("Gjenbruk til fylling", f"{gjenbruk_til_fill:,.0f} m³ (løs)".replace(",", " "))
+        with kk6: metric_card("Lass ut (totalt)",     f"{lass_bort_tot} lass")
+        with kk7: metric_card("Lass inn (tilkjørt)",  f"{lass_inn} lass")
+        with kk8: metric_card("Overbygning ut",        f"{lass_bort_over} lass")
+
+        # ── Sankey / stolpediagram ────────────────────────────────────────────
+        st.markdown("### 5. Masseflyt")
+        fig_sankey = go.Figure(go.Sankey(
+            arrangement="snap",
+            node=dict(
+                label=["Skjæring (løs)", "Overbygning (løs)",
+                       "Gjenbruk til fylling", "Deponi (overskudd)", "Tilkjørt masse",
+                       "Fyllvolum (løs)"],
+                color=["#2471a3", "#85929e",
+                       "#1e8449", "#e74c3c", "#f39c12",
+                       "#1e8449"],
+                pad=20, thickness=20,
+            ),
+            link=dict(
+                source=[0, 0, 1, 4],
+                target=[2, 3, 3, 5],
+                value=[
+                    max(gjenbruk_til_fill, 0.001),
+                    max(overskudd_los, 0.001),
+                    max(overbygg_los, 0.001),
+                    max(underskudd_los, 0.001),
+                ],
+                color=["#a9dfbf", "#f5b7b1", "#d5d8dc", "#fad7a0"],
+                label=["Gjenbruk", "Til deponi", "Til deponi", "Tilkjørt"],
+            ),
+        ))
+        fig_sankey.update_layout(
+            title="Masseflyt – Sankey-diagram",
+            height=340, margin=dict(l=10, r=10, t=40, b=10),
+        )
+        st.plotly_chart(fig_sankey, use_container_width=True)
+
+        # ── Detaljert rapport-tabell ──────────────────────────────────────────
+        st.markdown("### 6. Komplett massebalanserapport")
+        mb_rapport = pd.DataFrame([
+            {"Post": "Skjæringsvolum – fast masse",     "Verdi [m³]": round(skj_fast, 1),          "Kommentar": "Totalvolum som graves (inkl. fundamentgrøfter)"},
+            {"Post": "Løsningsfaktor (fast→løs)",       "Verdi [m³]": ef_los,                       "Kommentar": f"Svellingsfaktor ved oppgraving"},
+            {"Post": "Skjæringsvolum – løs masse",      "Verdi [m³]": round(skj_los, 1),            "Kommentar": "Volum ved oppgraving (lastebillass)"},
+            {"Post": "Overbygning – fast masse",        "Verdi [m³]": round(mb_overbygg, 1),         "Kommentar": "Toppmasse/torv som ikke gjenbrukes"},
+            {"Post": "Overbygning – løs masse",         "Verdi [m³]": round(overbygg_los, 1),        "Kommentar": f"× løsningsfaktor {ef_over}"},
+            {"Post": "Tilgjengelig for gjenbruk (løs)", "Verdi [m³]": round(til_gjenbruk_los, 1),   "Kommentar": "Skjæring – overbygning"},
+            {"Post": "Fyllbehov – løs masse",           "Verdi [m³]": round(fill_los_behov, 1),      "Kommentar": "Oppgitt fyllbehov"},
+            {"Post": "Komprimeringsgrad",                "Verdi [m³]": ef_komp,                       "Kommentar": "Løs→komprimert (typisk <1)"},
+            {"Post": "Fyllbehov – komprimert",          "Verdi [m³]": round(fill_komp_behov, 1),     "Kommentar": "Faktisk komprimert volum i bakken"},
+            {"Post": "Gjenbruk fra skjæring",           "Verdi [m³]": round(gjenbruk_til_fill, 1),   "Kommentar": "Maks gjenbruk (løs masse)"},
+            {"Post": "Overskuddsmasse til deponi",      "Verdi [m³]": round(overskudd_los, 1),       "Kommentar": "Løs masse som kjøres bort"},
+            {"Post": "Underskudd – tilkjørt masse",     "Verdi [m³]": round(underskudd_los, 1),      "Kommentar": "Løs masse som kjøres inn"},
+            {"Post": "Netto massebalanse",               "Verdi [m³]": round(netto_balanse, 1),       "Kommentar": "+ = overskudd · – = underskudd"},
+            {"Post": "─── Transport ───",               "Verdi [m³]": "",                             "Kommentar": ""},
+            {"Post": "Lassekapasitet pr. lass",         "Verdi [m³]": mb_lass_m3,                    "Kommentar": "m³ løs masse pr. kjøring"},
+            {"Post": "Lass ut – skjæringsmasse",        "Verdi [m³]": lass_bort_skj,                 "Kommentar": f"Til deponi ({mb_km_bort:.0f} km)"},
+            {"Post": "Lass ut – overbygning",           "Verdi [m³]": lass_bort_over,                "Kommentar": f"Toppmasse til deponi ({mb_km_bort:.0f} km)"},
+            {"Post": "Lass ut – totalt (netto)",        "Verdi [m³]": lass_bort_tot,                 "Kommentar": "Etter fratrekk av gjenbruk"},
+            {"Post": "Lass inn – tilkjørt fyllmasse",  "Verdi [m³]": lass_inn,                      "Kommentar": f"Fra leverandør ({mb_km_inn:.0f} km)"},
+        ])
+        st.dataframe(mb_rapport, use_container_width=True, hide_index=True,
+                     column_config={"Verdi [m³]": st.column_config.NumberColumn(format="%.1f")})
+
+        # Last ned
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button(
+                "Last ned massebalanse CSV",
+                mb_rapport.to_csv(index=False).encode("utf-8-sig"),
+                file_name="masseregnskap.csv", mime="text/csv",
+            )
+        with dl2:
+            # Lagre nøkkeltall til rapport-siden
+            st.session_state["rapport_masse_skjaering"] = f"{skj_fast:,.0f} m³".replace(",", " ")
+            st.session_state["rapport_masse_fylling"]   = f"{fill_los_behov:,.0f} m³".replace(",", " ")
+            st.session_state["rapport_masse_balanse"]   = bal_text
+            st.session_state["rapport_masse_lass_ut"]   = str(lass_bort_tot)
+            st.session_state["rapport_masse_lass_inn"]  = str(lass_inn)
+            st.caption("Nøkkeltall lagret til Rapport-siden.")
+
 
 elif valg == "Materialbytte":
     if st.button("← Hjem", key="hjem_mb"): _nav_to("Hjem")
@@ -3215,51 +3412,148 @@ elif valg == "Bygggenerator":
         """)
 
     st.subheader("1. Geometri og etasjer")
-    g1, g2, g3, g4 = st.columns(4)
+
+    PLAN_VALG_STANDARD  = ["Rektangel", "L-form / tilbygg", "Rektangel med åpning", "L-form med åpning"]
+    PLAN_VALG_FRIFORM   = ["Regulært polygon (n-kant)", "Oval / Ellipse", "Sirkel", "Frihånd polygon"]
+    alle_planvalg = PLAN_VALG_STANDARD + ["─── Frie former ───"] + PLAN_VALG_FRIFORM
+    planvalg = st.selectbox("Geometri / Bygningsform", alle_planvalg, key="bg_planvalg")
+
+    fri_form_aktiv = planvalg in PLAN_VALG_FRIFORM
     bg_params = {}
-    with g1:
-        planvalg = st.selectbox("Geometri", ["Rektangel", "L-form / tilbygg", "Rektangel med åpning", "L-form med åpning"])
-        bg_params["fag_x_r1"] = st.number_input("Fag X", min_value=1, max_value=20, value=4, step=1, key="bg_fx")
-        bg_params["fag_y_r1"] = st.number_input("Fag Y", min_value=1, max_value=10, value=2, step=1, key="bg_fy")
-    with g2:
-        bg_params["faglengde_x_mm"] = st.number_input("Faglengde X [mm]", min_value=1000, max_value=20000, value=8000, step=500, key="bg_dx")
-        bg_params["faglengde_y_mm"] = st.number_input("Faglengde Y [mm]", min_value=1000, max_value=20000, value=12000, step=500, key="bg_dy")
-    with g3:
-        bg_params["antall_etasjer"] = st.number_input("Antall etasjer", min_value=1, max_value=10, value=3, step=1, key="bg_levels")
+
+    # ── Etasjer og høyder (felles for alle typer) ──────────────────────────────
+    e1, e2, e3, e4 = st.columns(4)
+    with e1:
+        bg_params["antall_etasjer"] = st.number_input("Antall etasjer", min_value=1, max_value=30, value=3, step=1, key="bg_levels")
         bg_params["dekker_i_modell"] = bg_params["antall_etasjer"]
-        bg_params["etasjehoyde_mm"] = st.number_input("Etasjehøyde [mm]", min_value=2200, max_value=6000, value=3000, step=100, key="bg_floor_height")
-    with g4:
-        bg_params["dekke_tykkelse_mm"] = st.number_input("Dekketøykkelse [mm]", min_value=100, max_value=600, value=300, step=10, key="bg_slab_thk")
+    with e2:
+        bg_params["etasjehoyde_mm"] = st.number_input("Etasjehøyde [mm]", min_value=2200, max_value=8000, value=3000, step=100, key="bg_floor_height")
+    with e3:
+        bg_params["dekke_tykkelse_mm"] = st.number_input("Dekketykkelse [mm]", min_value=100, max_value=600, value=300, step=10, key="bg_slab_thk")
         bg_params["dekker_aktiv"] = "JA" if st.toggle("Generer dekker", value=True, key="bg_slabs_on") else "NEI"
+    with e4:
+        bg_params["ff_max_span_m"] = st.number_input(
+            "Maks bjelkespenn [m]", min_value=1.0, max_value=20.0, value=6.0, step=0.5,
+            key="bg_max_span",
+            help="Maksimalt spenn mellom søyler. Mellomliggende søyler settes inn automatisk der kanten er lengre."
+        )
 
-    use_r2 = planvalg in ["L-form / tilbygg", "L-form med åpning"]
-    use_opening = planvalg in ["Rektangel med åpning", "L-form med åpning"]
-    bg_params["rektangel2_aktiv"] = "JA" if use_r2 else "NEI"
-    if use_r2:
-        r1, r2, r3, r4 = st.columns(4)
-        with r1:
-            bg_params["fag_x_r2"] = st.number_input("Tilbygg fag X", min_value=1, max_value=20, value=2, step=1, key="bg_r2_fx")
-        with r2:
-            bg_params["fag_y_r2"] = st.number_input("Tilbygg fag Y", min_value=1, max_value=10, value=2, step=1, key="bg_r2_fy")
-        with r3:
-            bg_params["r2_offset_x_fag"] = st.number_input("Tilbygg offset X [fag]", min_value=0, max_value=20, value=2, step=1, key="bg_r2_ox")
-        with r4:
-            bg_params["r2_offset_y_fag"] = st.number_input("Tilbygg offset Y [fag]", min_value=0, max_value=10, value=0, step=1, key="bg_r2_oy")
-    else:
-        bg_params.update({"fag_x_r2": 0, "fag_y_r2": 0, "r2_offset_x_fag": 0, "r2_offset_y_fag": 0})
+    st.markdown("---")
 
-    if use_opening:
-        o1, o2, o3, o4 = st.columns(4)
-        with o1:
-            bg_params["opening_width_fag"] = st.number_input("Åpning bredde [fag]", min_value=1, max_value=10, value=1, step=1, key="bg_ow")
-        with o2:
-            bg_params["opening_height_fag"] = st.number_input("Åpning høyde [fag]", min_value=1, max_value=10, value=1, step=1, key="bg_oh")
-        with o3:
-            bg_params["opening_offset_x_fag"] = st.number_input("Åpning offset X [fag]", min_value=0, max_value=20, value=1, step=1, key="bg_oox")
-        with o4:
-            bg_params["opening_offset_y_fag"] = st.number_input("Åpning offset Y [fag]", min_value=0, max_value=10, value=1, step=1, key="bg_ooy")
+    if not fri_form_aktiv:
+        # ── Standard rektangel / L-form (eksisterende logikk) ─────────────────
+        g1, g2 = st.columns(2)
+        with g1:
+            bg_params["fag_x_r1"] = st.number_input("Fag X", min_value=1, max_value=20, value=4, step=1, key="bg_fx")
+            bg_params["fag_y_r1"] = st.number_input("Fag Y", min_value=1, max_value=10, value=2, step=1, key="bg_fy")
+        with g2:
+            bg_params["faglengde_x_mm"] = st.number_input("Faglengde X [mm]", min_value=1000, max_value=20000, value=8000, step=500, key="bg_dx")
+            bg_params["faglengde_y_mm"] = st.number_input("Faglengde Y [mm]", min_value=1000, max_value=20000, value=12000, step=500, key="bg_dy")
+
+        use_r2      = planvalg in ["L-form / tilbygg", "L-form med åpning"]
+        use_opening = planvalg in ["Rektangel med åpning", "L-form med åpning"]
+        bg_params["rektangel2_aktiv"] = "JA" if use_r2 else "NEI"
+        if use_r2:
+            r1, r2, r3, r4 = st.columns(4)
+            with r1: bg_params["fag_x_r2"] = st.number_input("Tilbygg fag X", min_value=1, max_value=20, value=2, step=1, key="bg_r2_fx")
+            with r2: bg_params["fag_y_r2"] = st.number_input("Tilbygg fag Y", min_value=1, max_value=10, value=2, step=1, key="bg_r2_fy")
+            with r3: bg_params["r2_offset_x_fag"] = st.number_input("Tilbygg offset X [fag]", min_value=0, max_value=20, value=2, step=1, key="bg_r2_ox")
+            with r4: bg_params["r2_offset_y_fag"] = st.number_input("Tilbygg offset Y [fag]", min_value=0, max_value=10, value=0, step=1, key="bg_r2_oy")
+        else:
+            bg_params.update({"fag_x_r2": 0, "fag_y_r2": 0, "r2_offset_x_fag": 0, "r2_offset_y_fag": 0})
+
+        if use_opening:
+            o1, o2, o3, o4 = st.columns(4)
+            with o1: bg_params["opening_width_fag"] = st.number_input("Åpning bredde [fag]", min_value=1, max_value=10, value=1, step=1, key="bg_ow")
+            with o2: bg_params["opening_height_fag"] = st.number_input("Åpning høyde [fag]", min_value=1, max_value=10, value=1, step=1, key="bg_oh")
+            with o3: bg_params["opening_offset_x_fag"] = st.number_input("Åpning offset X [fag]", min_value=0, max_value=20, value=1, step=1, key="bg_oox")
+            with o4: bg_params["opening_offset_y_fag"] = st.number_input("Åpning offset Y [fag]", min_value=0, max_value=10, value=1, step=1, key="bg_ooy")
+        else:
+            bg_params.update({"opening_width_fag": 0, "opening_height_fag": 0, "opening_offset_x_fag": 0, "opening_offset_y_fag": 0})
+
+        _ff_vertices = None  # ingen fri-form
+
     else:
-        bg_params.update({"opening_width_fag": 0, "opening_height_fag": 0, "opening_offset_x_fag": 0, "opening_offset_y_fag": 0})
+        # ── Fri form ──────────────────────────────────────────────────────────
+        if not _FREE_FORM_OK:
+            st.error("building_forms.py ble ikke lastet. Sjekk at filen finnes i mappen.")
+        bg_params.update({"fag_x_r1": 1, "fag_y_r1": 1, "faglengde_x_mm": 8000, "faglengde_y_mm": 8000,
+                           "rektangel2_aktiv": "NEI", "fag_x_r2": 0, "fag_y_r2": 0,
+                           "r2_offset_x_fag": 0, "r2_offset_y_fag": 0,
+                           "opening_width_fag": 0, "opening_height_fag": 0,
+                           "opening_offset_x_fag": 0, "opening_offset_y_fag": 0})
+
+        ff_params = {}
+
+        if planvalg == "Regulært polygon (n-kant)":
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                ff_params["poly_n_sides"] = st.number_input(
+                    "Antall sider", min_value=3, max_value=32, value=6, step=1, key="ff_nsides",
+                    help="3=trekant, 4=kvadrat, 5=pentagon, 6=sekskant, 8=oktagon …")
+            with f2:
+                ff_params["poly_radius_m"] = st.number_input(
+                    "Radius [m]", min_value=1.0, max_value=200.0, value=12.0, step=0.5, key="ff_radius",
+                    help="Avstand fra sentrum til hjørne")
+            with f3:
+                ff_params["poly_rotation_deg"] = st.number_input(
+                    "Rotasjon [°]", min_value=0.0, max_value=360.0, value=0.0, step=5.0, key="ff_rot")
+            _ff_shape = "polygon_n"
+            _ff_label = f"{int(ff_params['poly_n_sides'])}-kant  r={ff_params['poly_radius_m']:.1f} m"
+
+        elif planvalg == "Oval / Ellipse":
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                ff_params["ellipse_a_m"] = st.number_input(
+                    "Halvakse A (X) [m]", min_value=1.0, max_value=200.0, value=20.0, step=1.0, key="ff_a")
+            with f2:
+                ff_params["ellipse_b_m"] = st.number_input(
+                    "Halvakse B (Y) [m]", min_value=1.0, max_value=200.0, value=12.0, step=1.0, key="ff_b")
+            with f3:
+                ff_params["ellipse_segments"] = st.number_input(
+                    "Segmenter", min_value=12, max_value=128, value=48, step=4, key="ff_seg",
+                    help="Antall punkter i ellipse-approks. Høyere = glattere")
+            _ff_shape = "ellipse"
+            _ff_label = f"Ellipse  a={ff_params['ellipse_a_m']:.1f} m  b={ff_params['ellipse_b_m']:.1f} m"
+
+        elif planvalg == "Sirkel":
+            f1, f2 = st.columns(2)
+            with f1:
+                ff_params["circle_r_m"] = st.number_input(
+                    "Radius [m]", min_value=1.0, max_value=200.0, value=15.0, step=0.5, key="ff_cr")
+            with f2:
+                ff_params["circle_segments"] = st.number_input(
+                    "Segmenter", min_value=12, max_value=128, value=48, step=4, key="ff_cseg")
+            _ff_shape = "circle"
+            _ff_label = f"Sirkel  r={ff_params['circle_r_m']:.1f} m"
+
+        else:  # Frihånd polygon
+            st.info("Skriv inn XY-koordinater for hvert hjørne (i meter). Minimum 3 hjørner. Siste hjørne kobles automatisk til det første.")
+            default_pts = [
+                {"X [m]": 0.0,  "Y [m]": 0.0},
+                {"X [m]": 16.0, "Y [m]": 0.0},
+                {"X [m]": 20.0, "Y [m]": 8.0},
+                {"X [m]": 10.0, "Y [m]": 14.0},
+                {"X [m]": 0.0,  "Y [m]": 10.0},
+            ]
+            edited_pts = st.data_editor(
+                pd.DataFrame(default_pts),
+                key="ff_freehand_table",
+                num_rows="dynamic",
+                use_container_width=False,
+                column_config={
+                    "X [m]": st.column_config.NumberColumn("X [m]", format="%.2f"),
+                    "Y [m]": st.column_config.NumberColumn("Y [m]", format="%.2f"),
+                },
+            )
+            ff_params["freehand_vertices"] = edited_pts.to_dict("records")
+            _ff_shape = "freehand"
+            _ff_label = f"Frihånd  ({len(ff_params['freehand_vertices'])} hjørner)"
+
+        if _FREE_FORM_OK:
+            _ff_vertices = generate_free_form_vertices(_ff_shape, ff_params)
+        else:
+            _ff_vertices = None
 
     st.subheader("2. Materiale og kvalitet")
     m1, m2, m3 = st.columns(3)
@@ -3279,30 +3573,112 @@ elif valg == "Bygggenerator":
         bg_params["skalltype"] = st.selectbox("Skalltype", ["Platt skall", "Hulldekke-prinsipp", "Massivtredekke"], key="bg_shell")
         bg_params["dekke_materiale"] = make_material_profile_label(bg_params["dekke_materialtype"], bg_params["dekke_kvalitet"], f"t={bg_params['dekke_tykkelse_mm']:.0f} mm")
 
-    geom = generate_plan_geometry(bg_params)
-    frame_df = generate_frame_export_parametric(bg_params)
-    slab_df = generate_slab_export(bg_params) if bg_params["dekker_aktiv"] == "JA" else pd.DataFrame()
+    n_etasjer  = int(bg_params["antall_etasjer"])
+    etasje_h_m = float(bg_params["etasjehoyde_mm"]) / 1000.0
+    slab_thk_m = float(bg_params["dekke_tykkelse_mm"]) / 1000.0
+
+    if fri_form_aktiv and _FREE_FORM_OK and _ff_vertices and len(_ff_vertices) >= 3:
+        # ── Fri-form pipeline ──────────────────────────────────────────────────
+        frame_df = free_form_frame_export(
+            vertices      = _ff_vertices,
+            n_levels      = n_etasjer,
+            floor_h_m     = etasje_h_m,
+            col_mat       = bg_params.get("søylemateriale", "Stål"),
+            col_qual      = bg_params.get("søylekvalitet", "S355"),
+            col_prof      = bg_params.get("søyleprofil", "HEB 200"),
+            beam_mat      = bg_params.get("bjelkemateriale", "Stål"),
+            beam_qual     = bg_params.get("bjelkekvalitet", "S355"),
+            beam_prof     = bg_params.get("bjelkeprofil", "HEB 300"),
+            max_span_m    = float(bg_params.get("ff_max_span_m", 6.0)),
+        )
+        slab_df = (
+            free_form_slab_export(
+                vertices   = _ff_vertices,
+                n_levels   = n_etasjer,
+                floor_h_m  = etasje_h_m,
+                slab_thk_m = slab_thk_m,
+                slab_mat   = bg_params.get("dekke_materialtype", "Betong"),
+                slab_qual  = bg_params.get("dekke_kvalitet", "B35"),
+            )
+            if bg_params["dekker_aktiv"] == "JA"
+            else pd.DataFrame()
+        )
+        # Slå sammen til felles qty_df (samme kolonner som standard)
+        alle = [frame_df]
+        if not slab_df.empty:
+            alle.append(slab_df)
+        qty_df = pd.concat(alle, ignore_index=True) if alle else pd.DataFrame()
+        ff_area = free_form_area(_ff_vertices)
+        ff_perim = free_form_perimeter(_ff_vertices)
+
+        geom = None  # brukes ikke i fri-form
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1: metric_card("Planform", planvalg.split("(")[0].strip())
+        with k2: metric_card("Areal plan", f"{ff_area:,.1f} m²".replace(",", " "))
+        with k3: metric_card("Elementer", f"{len(qty_df):,}".replace(",", " "))
+        with k4: metric_card("Kostnad", f"{pd.to_numeric(qty_df.get('Kostnad [kr]', pd.Series(dtype=float)), errors='coerce').fillna(0).sum():,.0f} kr".replace(",", " "))
+        with k5: metric_card("CO₂", f"{pd.to_numeric(qty_df.get('CO2 [kgCO2e]', pd.Series(dtype=float)), errors='coerce').fillna(0).sum():,.0f} kgCO₂e".replace(",", " "))
+
+        p_left, p_right = st.columns([1, 1.15])
+        with p_left:
+            st.subheader("3. 2D-plan")
+            _ff_max_span                      = float(bg_params.get("ff_max_span_m", 6.0))
+            _ff_edge_pts                      = _edge_column_points(_ff_vertices, _ff_max_span)
+            _ff_x_beams, _ff_y_beams, _ff_gcols = _grid_lines(_ff_vertices, _ff_max_span)
+            _ff_int_lines                     = _ff_x_beams + _ff_y_beams
+            st.pyplot(plot_free_form_plan(
+                _ff_vertices, shape_label=_ff_label,
+                edge_col_pts=_ff_edge_pts,
+                interior_lines=_ff_int_lines,
+                grid_col_pts=_ff_gcols,
+            ))
+        with p_right:
+            st.subheader("4. 3D-prinsippmodell")
+            st.plotly_chart(
+                plot_free_form_3d(
+                    _ff_vertices, n_etasjer, etasje_h_m,
+                    edge_col_pts=_ff_edge_pts,
+                    grid_col_pts=_ff_gcols,
+                    interior_lines=_ff_int_lines,
+                ),
+                use_container_width=True,
+            )
+
+        qa_df = pd.DataFrame([{
+            "Kontroll": "Fri form",
+            "Status": "OK" if len(_ff_vertices) >= 3 else "FEIL",
+            "Melding": f"{len(_ff_vertices)} hjørner, areal={ff_area:.1f} m², omkrets={ff_perim:.1f} m",
+            "Anbefaling": "",
+        }])
+
+    else:
+        # ── Standard rektangel / L-form pipeline ──────────────────────────────
+        geom     = generate_plan_geometry(bg_params)
+        frame_df = generate_frame_export_parametric(bg_params)
+        slab_df  = generate_slab_export(bg_params) if bg_params["dekker_aktiv"] == "JA" else pd.DataFrame()
+        qty_df   = frame_to_quantity_dataset(frame_df, slab_df, bg_params)
+        qa_df    = run_project_qa(bg_params, frame_df, slab_df if not slab_df.empty else pd.DataFrame(columns=["DeckID"]))
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1: metric_card("Planform", geom["planformkode"])
+        with k2: metric_card("Aktivt areal", f"{geom['active_area_m2']:,.1f} m²".replace(",", " "))
+        with k3: metric_card("Elementer", f"{len(qty_df):,}".replace(",", " "))
+        with k4: metric_card("Kostnad", f"{qty_df['Kostnad [kr]'].sum():,.0f} kr".replace(",", " "))
+        with k5: metric_card("CO₂", f"{qty_df['CO2 [kgCO2e]'].sum():,.0f} kgCO₂e".replace(",", " "))
+
+        p_left, p_right = st.columns([1, 1.15])
+        with p_left:
+            st.subheader("3. 2D-plan")
+            st.pyplot(plot_plan_geometry(geom))
+        with p_right:
+            st.subheader("4. 3D-prinsippmodell")
+            st.plotly_chart(plot_frame_3d(frame_df, slab_df), use_container_width=True)
+
     # Lagre i session state slik at Rapport-siden kan bruke dem til IFC-eksport og visning
-    st.session_state["bg_params_last"] = bg_params
-    st.session_state["bg_frame_df_last"] = frame_df
-    st.session_state["bg_slab_df_last"] = slab_df
-    qty_df = frame_to_quantity_dataset(frame_df, slab_df, bg_params)
-    qa_df = run_project_qa(bg_params, frame_df, slab_df if not slab_df.empty else pd.DataFrame(columns=["DeckID"]))
-
-    k1, k2, k3, k4, k5 = st.columns(5)
-    with k1: metric_card("Planform", geom["planformkode"])
-    with k2: metric_card("Aktivt areal", f"{geom['active_area_m2']:,.1f} m²".replace(",", " "))
-    with k3: metric_card("Elementer", f"{len(qty_df):,}".replace(",", " "))
-    with k4: metric_card("Kostnad", f"{qty_df['Kostnad [kr]'].sum():,.0f} kr".replace(",", " "))
-    with k5: metric_card("CO₂", f"{qty_df['CO2 [kgCO2e]'].sum():,.0f} kgCO₂e".replace(",", " "))
-
-    p_left, p_right = st.columns([1, 1.15])
-    with p_left:
-        st.subheader("3. 2D-plan")
-        st.pyplot(plot_plan_geometry(geom))
-    with p_right:
-        st.subheader("4. 3D-prinsippmodell")
-        st.plotly_chart(plot_frame_3d(frame_df, slab_df), use_container_width=True)
+    st.session_state["bg_params_last"]    = bg_params
+    st.session_state["bg_frame_df_last"]  = frame_df
+    st.session_state["bg_slab_df_last"]   = slab_df
 
     # Lagre nøkkeltall til rapport-siden
     st.session_state["rapport_bg_elementer"] = str(len(qty_df))
